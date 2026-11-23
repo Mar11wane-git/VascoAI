@@ -1,0 +1,7 @@
+.venv
+venv
+__pycache__
+react-app/node_modules
+.env
+backend/users_db.json
+.git
