@@ -9,4 +9,7 @@ react-app/node_modules/
 
 # Secrets & local user DB
 .env
-backend/users_db.json
+backend/users_db*.json
+
+# Database exports (contain user data)
+*.sql

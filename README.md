@@ -80,3 +80,10 @@ react-app/src/
 - Le HTML produit par le modèle est assaini (DOMPurify) avant affichage.
 - `fetch_url` refuse localhost, les réseaux privés et les adresses de métadonnées cloud, à chaque redirection.
 - Les outils désactivés sont refusés à l'exécution, même si le modèle tente de les appeler.
+
+## Base de données MySQL
+
+Les comptes, sessions, profils, préférences et statistiques sont stockés dans MySQL (base `Vasco`).
+Configuration dans `.env` : `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`.
+Les tables sont créées automatiquement au démarrage (`users`, `sessions`, `user_profiles`, `user_stats`, `user_daily_usage`, `user_activity`).
+L'ancien fichier `backend/users_db.json` est importé une seule fois puis renommé en `users_db.migrated.json`.

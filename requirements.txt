@@ -12,3 +12,5 @@ anthropic>=2.6.0
 ddgs>=9.0.0
 lxml>=5.0.0
 tzdata>=2024.1
+pymysql>=1.1.0
+cryptography>=42.0.0

@@ -1,5 +1,29 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import {
+  AlertTriangle, Brain, Check, ChevronDown, Copy, Info, RefreshCw, Square, Volume2, X,
+} from 'lucide-react';
 import { renderMarkdown } from '../lib/markdown.js';
+import { toolIcon } from '../lib/icons.js';
+
+const ease = [0.22, 1, 0.36, 1];
+
+function CopyButton({ text, onCopy }) {
+  const [done, setDone] = useState(false);
+  return (
+    <button
+      className="msg-action-btn"
+      onClick={() => {
+        onCopy(text);
+        setDone(true);
+        setTimeout(() => setDone(false), 1600);
+      }}
+    >
+      {done ? <Check size={14} /> : <Copy size={14} />}
+      <span>{done ? 'Copié' : 'Copier'}</span>
+    </button>
+  );
+}
 
 /**
  * Reveals streamed text progressively instead of in the bursts the network delivers.
@@ -84,26 +108,50 @@ function ThinkingBlock({ text, active }) {
   const isOpen = open === null ? active : open;
   const words = text.trim().split(/\s+/).length;
   return (
-    <div className={`agent-thinking ${active ? 'active' : ''}`}>
+    <motion.div
+      className={`agent-thinking ${active ? 'active' : ''}`}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25, ease }}
+    >
       <button type="button" className="agent-thinking-head" onClick={() => setOpen(!isOpen)}>
-        <span className={`thinking-icon ${active ? 'pulse' : ''}`}>🧠</span>
-        <span>{active ? 'Réflexion en cours…' : 'Réflexion'}</span>
+        <span className={`thinking-icon ${active ? 'pulse' : ''}`}><Brain size={15} /></span>
+        <span className={active ? 'shimmer-text' : ''}>{active ? 'Réflexion en cours…' : 'Réflexion'}</span>
         <span className="agent-muted">{words} mots</span>
-        <span className={`chev ${isOpen ? 'open' : ''}`}>▾</span>
+        <ChevronDown size={15} className={`chev ${isOpen ? 'open' : ''}`} />
       </button>
-      {isOpen && <div className="agent-thinking-body" dir="auto">{text}</div>}
-    </div>
+      <AnimatePresence initial={false}>
+        {isOpen && (
+          <motion.div
+            className="agent-thinking-body"
+            dir="auto"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.22, ease }}
+          >
+            {text}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
   );
 }
 
 function ToolCard({ part, onOpenImage }) {
   const [open, setOpen] = useState(false);
   const status = part.status || 'running';
+  const Icon = toolIcon(part.name);
   return (
-    <div className={`tool-card status-${status}`}>
+    <motion.div
+      className={`tool-card status-${status}`}
+      initial={{ opacity: 0, y: 6, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      transition={{ duration: 0.25, ease }}
+    >
       <button type="button" className="tool-card-head" onClick={() => setOpen(!open)}>
-        <span className="tool-card-icon">{part.icon || '🛠️'}</span>
-        <span className="tool-card-label">{part.label || part.name}</span>
+        <span className="tool-card-icon"><Icon size={15} /></span>
+        <span className={`tool-card-label ${status === 'running' ? 'shimmer-text' : ''}`}>{part.label || part.name}</span>
         <span className="tool-card-arg" dir="auto">{argSummary(part.name, part.args)}</span>
         <span className="tool-card-meta">
           {status === 'running' ? (
@@ -112,9 +160,12 @@ function ToolCard({ part, onOpenImage }) {
             <>
               <span className="tool-card-summary">{part.summary}</span>
               <span className="tool-card-time">{formatMs(part.duration_ms)}</span>
-              <span className={`tool-status-dot ${status}`}>{status === 'ok' ? '✓' : '✕'}</span>
+              <span className={`tool-status-dot ${status}`}>
+                {status === 'ok' ? <Check size={11} strokeWidth={3} /> : <X size={11} strokeWidth={3} />}
+              </span>
             </>
           )}
+          <ChevronDown size={14} className={`chev ${open ? 'open' : ''}`} />
         </span>
       </button>
       {part.image_url && status !== 'running' && (
@@ -133,7 +184,7 @@ function ToolCard({ part, onOpenImage }) {
           )}
         </div>
       )}
-    </div>
+    </motion.div>
   );
 }
 
@@ -175,8 +226,8 @@ export default function AgentMessage({ msg, isLast, onCopy, onSpeak, onRegenerat
         <Markdown text={msg.content} />
         <Sources sources={msg.sources} />
         <div className="msg-actions">
-          <button className="msg-action-btn" onClick={() => onCopy(msg.content)}>📋 Copier</button>
-          <button className="msg-action-btn" onClick={() => onSpeak(msg.content)}>🔊 Écouter</button>
+          <CopyButton text={msg.content} onCopy={onCopy} />
+          <button className="msg-action-btn" onClick={() => onSpeak(msg.content)}><Volume2 size={14} /><span>Écouter</span></button>
         </div>
       </>
     );
@@ -193,32 +244,36 @@ export default function AgentMessage({ msg, isLast, onCopy, onSpeak, onRegenerat
         {parts.map((p, i) => {
           if (p.type === 'reasoning') return <ThinkingBlock key={i} text={p.text} active={streaming && i === lastIdx} />;
           if (p.type === 'tool') return <ToolCard key={p.id || i} part={p} onOpenImage={onOpenImage} />;
-          if (p.type === 'notice') return <div key={i} className="agent-notice">ℹ️ {p.text}</div>;
+          if (p.type === 'notice') return <div key={i} className="agent-notice"><Info size={14} /> {p.text}</div>;
           return <Markdown key={i} text={p.text} streaming={streaming && i === lastIdx} />;
         })}
         {showWaiting && (
-          <div className="agent-working">
-            <div className="typing-indicator"><div className="typing-dot" /><div className="typing-dot" /><div className="typing-dot" /></div>
-            <span>{msg.statusText || (parts.length ? 'Analyse des résultats…' : 'Vasco réfléchit…')}</span>
-          </div>
+          <motion.div className="agent-working" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+            <span className="agent-orb" aria-hidden="true" />
+            <span className="shimmer-text">{msg.statusText || (parts.length ? 'Analyse des résultats…' : 'Vasco réfléchit…')}</span>
+          </motion.div>
         )}
-        {msg.status === 'error' && <div className="agent-error">⚠️ {msg.error}</div>}
-        {msg.status === 'stopped' && <div className="agent-notice">⏹ Génération arrêtée.</div>}
+        {msg.status === 'error' && <div className="agent-error"><AlertTriangle size={15} /> {msg.error}</div>}
+        {msg.status === 'stopped' && <div className="agent-notice"><Square size={12} /> Génération arrêtée.</div>}
       </div>
 
       {!streaming && <Sources sources={msg.sources} />}
 
       {!streaming && (
-        <div className="msg-actions">
-          <button className="msg-action-btn" onClick={() => onCopy(msg.content)}>📋 Copier</button>
-          {msg.content && <button className="msg-action-btn" onClick={() => onSpeak(msg.content)}>🔊 Écouter</button>}
-          {isLast && onRegenerate && <button className="msg-action-btn" onClick={onRegenerate}>↻ Régénérer</button>}
+        <motion.div className="msg-actions" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.1 }}>
+          <CopyButton text={msg.content} onCopy={onCopy} />
+          {msg.content && (
+            <button className="msg-action-btn" onClick={() => onSpeak(msg.content)}><Volume2 size={14} /><span>Écouter</span></button>
+          )}
+          {isLast && onRegenerate && (
+            <button className="msg-action-btn" onClick={onRegenerate}><RefreshCw size={14} /><span>Régénérer</span></button>
+          )}
           {msg.stats && (
             <span className="agent-stats">
               {msg.stats.steps} étape{msg.stats.steps > 1 ? 's' : ''} · {msg.stats.tool_calls} outil{msg.stats.tool_calls > 1 ? 's' : ''} · {formatMs(msg.stats.elapsed_ms)}
             </span>
           )}
-        </div>
+        </motion.div>
       )}
     </>
   );

@@ -1,4 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { motion } from 'framer-motion';
+import { Globe, Languages, Mic, Wrench } from 'lucide-react';
+import VascoLogo from './VascoLogo.jsx';
+
+const FEATURES = [
+  { icon: Globe, label: 'Recherche Web en direct' },
+  { icon: Wrench, label: 'Outils & calculs exacts' },
+  { icon: Mic, label: 'Conversation vocale' },
+  { icon: Languages, label: 'Darija · FR · AR · EN' },
+];
 
 export default function AuthPage({ onAuthSuccess }) {
   const [mode, setMode] = useState('login'); // 'login' | 'register'
@@ -197,26 +207,51 @@ export default function AuthPage({ onAuthSuccess }) {
 
   return (
     <div className="auth-screen">
-      <div className="auth-ambient-glow glow-1" />
-      <div className="auth-ambient-glow glow-2" />
+      <div className="auth-shell">
+      <motion.aside
+        className="auth-showcase"
+        initial={{ opacity: 0, x: -20 }}
+        animate={{ opacity: 1, x: 0 }}
+        transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+      >
+        <motion.div
+          className="auth-showcase-logo"
+          animate={{ y: [0, -8, 0] }}
+          transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
+        >
+          <VascoLogo size={112} />
+        </motion.div>
+        <h1>
+          L’agent IA qui <span className="serif-accent">cherche, raisonne</span> et agit pour vous.
+        </h1>
+        <p>
+          Vasco lit le Web en direct, utilise de vrais outils et vous répond en Français, Darija, Arabe ou Anglais —
+          chaque étape est visible.
+        </p>
+        <div className="auth-features">
+          {FEATURES.map((f, i) => (
+            <motion.div
+              key={f.label}
+              className="auth-feature"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.25 + i * 0.08 }}
+            >
+              <f.icon size={17} /> {f.label}
+            </motion.div>
+          ))}
+        </div>
+      </motion.aside>
 
-      <div className="auth-card">
+      <motion.div
+        className="auth-card"
+        initial={{ opacity: 0, y: 16, scale: 0.98 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        transition={{ duration: 0.5, delay: 0.1, ease: [0.22, 1, 0.36, 1] }}
+      >
         {/* Vasco Brand Header */}
         <div className="auth-brand">
-          <div className="auth-logo">
-            <svg viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <defs>
-                <linearGradient id="vascoAuthGrad" x1="0" y1="0" x2="36" y2="36" gradientUnits="userSpaceOnUse">
-                  <stop offset="0%" stopColor="#2563eb" />
-                  <stop offset="50%" stopColor="#0891b2" />
-                  <stop offset="100%" stopColor="#14b8a6" />
-                </linearGradient>
-              </defs>
-              <rect width="36" height="36" rx="10" fill="url(#vascoAuthGrad)" />
-              <path d="M18 6L21.5 14.5L30 18L21.5 21.5L18 30L14.5 21.5L6 18L14.5 14.5L18 6Z" fill="white" />
-              <circle cx="18" cy="18" r="2.5" fill="#2563eb" />
-            </svg>
-          </div>
+          <div className="auth-mobile-logo"><VascoLogo size={56} /></div>
           <h2>{mode === 'login' ? 'Connexion à Vasco AI' : 'Créer un compte Vasco AI'}</h2>
           <p>
             {mode === 'login'
@@ -332,6 +367,7 @@ export default function AuthPage({ onAuthSuccess }) {
             {loading ? 'Connexion en cours...' : mode === 'login' ? 'Se connecter à Vasco' : 'Créer mon compte'}
           </button>
         </form>
+      </motion.div>
       </div>
 
       {/* Official GitHub OAuth 2.0 Device Flow Modal (https://github.com/login/device) */}

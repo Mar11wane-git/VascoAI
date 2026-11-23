@@ -3,8 +3,10 @@ import json
 import os
 
 import httpx
+from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header, WebSocket
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header, WebSocket, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, RedirectResponse, HTMLResponse, StreamingResponse
@@ -31,6 +33,7 @@ from backend.auth import (
     exchange_github_code_for_session,
     start_github_device_flow,
     poll_github_device_flow,
+    can_manage_server_keys,
     COMPLETED_OAUTH_STATES,
 )
 from backend.ai_providers import (
@@ -41,11 +44,23 @@ from backend.ai_providers import (
 )
 from backend.agent.runner import run_agent
 from backend.agent.tools import tools_catalog, code_execution_enabled
+from backend import db
+from backend import profile as profiles
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await run_in_threadpool(db.init_db)
+    cfg = db._config()
+    print(f"[Vasco] Base MySQL prête : {cfg['user']}@{cfg['host']}:{cfg['port']}/{cfg['database']}")
+    yield
+
 
 app = FastAPI(
     title="Vasco AI Agent API",
     description="Agent IA autonome multimodal : outils, recherche web, streaming temps réel (Darija, Français, Anglais, Arabe)",
-    version="4.0.0",
+    version="4.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -59,15 +74,26 @@ app.add_middleware(
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
 
 
-def require_user(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    """Resolves the session from an `Authorization: Bearer <token>` header."""
-    token = ""
+def bearer_token(authorization: Optional[str] = Header(default=None)) -> str:
     if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
+        return authorization[7:].strip()
+    return ""
+
+
+def require_user(token: str = Depends(bearer_token)) -> Dict[str, Any]:
+    """Resolves the session from an `Authorization: Bearer <token>` header."""
     user = get_user_by_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Session expirée ou invalide. Reconnectez-vous.")
     return user
+
+
+def client_info(request: Request) -> Dict[str, str]:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return {
+        "user_agent": request.headers.get("user-agent", ""),
+        "ip": forwarded or (request.client.host if request.client else ""),
+    }
 
 
 class ChatMessage(BaseModel):
@@ -260,17 +286,17 @@ async def list_models():
 
 
 @app.post("/api/auth/register")
-async def api_register(req: AuthRegisterRequest):
+def api_register(req: AuthRegisterRequest, request: Request):
     try:
-        return register_email_user(req.name, req.email, req.password)
+        return register_email_user(req.name, req.email, req.password, **client_info(request))
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
 
 @app.post("/api/auth/login")
-async def api_login(req: AuthLoginRequest):
+def api_login(req: AuthLoginRequest, request: Request):
     try:
-        return login_email_user(req.email, req.password)
+        return login_email_user(req.email, req.password, **client_info(request))
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
@@ -365,7 +391,7 @@ async def api_oauth_state_status(state: str):
 
 
 @app.post("/api/auth/me")
-async def api_auth_me(req: AuthTokenRequest):
+def api_auth_me(req: AuthTokenRequest):
     user = get_user_by_token(req.token)
     if not user:
         raise HTTPException(status_code=401, detail="Session expirée ou invalide.")
@@ -373,14 +399,129 @@ async def api_auth_me(req: AuthTokenRequest):
 
 
 @app.post("/api/auth/logout")
-async def api_auth_logout(req: AuthTokenRequest):
+def api_auth_logout(req: AuthTokenRequest):
     logout_token(req.token)
     return {"status": "ok"}
+
+
+# =====================================================================
+# PROFILE SPACE (MySQL)
+# =====================================================================
+
+class ProfileUpdateRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+    name: Optional[str] = None
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    headline: Optional[str] = None
+    bio: Optional[str] = None
+    phone: Optional[str] = None
+    birth_date: Optional[str] = None
+    gender: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    job_title: Optional[str] = None
+    company: Optional[str] = None
+    website: Optional[str] = None
+    github: Optional[str] = None
+    linkedin: Optional[str] = None
+    twitter: Optional[str] = None
+    interests: Optional[List[str]] = None
+    cover_theme: Optional[str] = None
+    language: Optional[str] = None
+    timezone: Optional[str] = None
+    pref_theme: Optional[str] = None
+    pref_voice: Optional[str] = None
+    pref_auto_tts: Optional[bool] = None
+    pref_web_search: Optional[bool] = None
+    system_prompt: Optional[str] = None
+
+
+class AvatarRequest(BaseModel):
+    data_url: str = ""
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = ""
+    new_password: str
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str = ""
+    confirm: str = ""
+
+
+def _profile_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except db.DatabaseError as de:
+        raise HTTPException(status_code=503, detail=str(de))
+
+
+@app.get("/api/profile")
+def api_profile(user: Dict[str, Any] = Depends(require_user)):
+    return _profile_call(profiles.get_profile, user["id"])
+
+
+@app.put("/api/profile")
+def api_profile_update(req: ProfileUpdateRequest, request: Request, user: Dict[str, Any] = Depends(require_user)):
+    data = req.model_dump(exclude_none=True)
+    return _profile_call(profiles.update_profile, user["id"], data, client_info(request)["ip"])
+
+
+@app.post("/api/profile/avatar")
+def api_profile_avatar(req: AvatarRequest, request: Request, user: Dict[str, Any] = Depends(require_user)):
+    return _profile_call(profiles.update_avatar, user["id"], req.data_url, client_info(request)["ip"])
+
+
+@app.post("/api/profile/password")
+def api_profile_password(req: PasswordChangeRequest, request: Request,
+                         user: Dict[str, Any] = Depends(require_user), token: str = Depends(bearer_token)):
+    closed = _profile_call(profiles.change_password, user["id"], req.current_password, req.new_password,
+                           token, client_info(request)["ip"])
+    return {"status": "ok", "sessions_closed": closed}
+
+
+@app.get("/api/profile/sessions")
+def api_profile_sessions(user: Dict[str, Any] = Depends(require_user), token: str = Depends(bearer_token)):
+    return {"sessions": _profile_call(profiles.list_sessions, user["id"], token)}
+
+
+@app.delete("/api/profile/sessions/{session_id}")
+def api_profile_revoke_session(session_id: str, user: Dict[str, Any] = Depends(require_user),
+                               token: str = Depends(bearer_token)):
+    if not _profile_call(profiles.revoke_session, user["id"], session_id, token):
+        raise HTTPException(status_code=404, detail="Session introuvable.")
+    return {"status": "ok"}
+
+
+@app.delete("/api/profile/sessions")
+def api_profile_revoke_others(user: Dict[str, Any] = Depends(require_user), token: str = Depends(bearer_token)):
+    return {"status": "ok", "closed": _profile_call(profiles.revoke_other_sessions, user["id"], token)}
+
+
+@app.get("/api/profile/activity")
+def api_profile_activity(user: Dict[str, Any] = Depends(require_user)):
+    return {"activity": _profile_call(profiles.list_activity, user["id"])}
+
+
+@app.post("/api/profile/delete")
+def api_profile_delete(req: DeleteAccountRequest, user: Dict[str, Any] = Depends(require_user)):
+    _profile_call(profiles.delete_account, user["id"], req.password, req.confirm)
+    return {"status": "deleted"}
 
 
 @app.post("/api/settings/keys")
 async def update_keys(payload: ApiKeysUpdateRequest, user: Dict[str, Any] = Depends(require_user)):
     """Updates and persists API keys in .env."""
+    if not can_manage_server_keys(user):
+        raise HTTPException(
+            status_code=403,
+            detail="Seul l'administrateur du serveur peut modifier les clés API (variable ADMIN_EMAILS).",
+        )
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     new_status = save_api_keys(updates)
     return {
@@ -404,6 +545,9 @@ async def upload_files(files: List[UploadFile] = File(...), user: Dict[str, Any]
             content_type=file.content_type or "",
         )
         processed_results.append(result)
+    ok_count = sum(1 for r in processed_results if r.get("category") != "error")
+    if ok_count:
+        await run_in_threadpool(profiles.record_usage, user["id"], files=ok_count)
     return {"files": processed_results}
 
 
@@ -468,6 +612,7 @@ async def voice_reply_endpoint(req: VoiceReplyRequest, user: Dict[str, Any] = De
                                custom_system_prompt=req.system_prompt, web_search=req.web_search, darija=darija)
     if result["error"] and not result["reply"]:
         raise HTTPException(status_code=502, detail=result["error"])
+    await run_in_threadpool(profiles.record_usage, user["id"], voice_turns=1)
     audio_data_url, lang = None, "ar-MA" if darija else "fr-FR"
     if req.speak and result["reply"]:
         try:
@@ -524,6 +669,9 @@ async def chat_endpoint(req: ChatRequest, user: Dict[str, Any] = Depends(require
             image_generation_mode=req.image_gen,
             voice_mode=req.voice_mode,
         )
+        await run_in_threadpool(
+            profiles.record_usage, user["id"], messages=1, images=1 if req.image_gen else 0
+        )
 
         audio_data_url = None
         detected_lang = "fr-FR"
@@ -567,6 +715,7 @@ async def agent_stream(req: AgentRequest, user: Dict[str, Any] = Depends(require
         raise HTTPException(status_code=400, detail="Aucun message fourni.")
 
     async def event_source():
+        tool_calls = images = 0
         async for event in run_agent(
             provider=req.provider,
             model=req.model,
@@ -577,7 +726,14 @@ async def agent_stream(req: AgentRequest, user: Dict[str, Any] = Depends(require
             image_mode=req.image_gen,
             custom_system_prompt=req.system_prompt,
         ):
+            if event.get("type") == "tool_end" and event.get("ok") and event.get("image_url"):
+                images += 1
+            if event.get("type") == "done":
+                tool_calls = int(event.get("tool_calls") or 0)
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        await run_in_threadpool(
+            profiles.record_usage, user["id"], messages=1, tool_calls=tool_calls, images=images
+        )
 
     return StreamingResponse(
         event_source(),

@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -9,114 +10,147 @@ from typing import Dict, Any, Optional
 import httpx
 from dotenv import load_dotenv
 
+from backend import db
+
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-USERS_DB_PATH = os.path.join(os.path.dirname(__file__), "users_db.json")
 load_dotenv(ENV_PATH)
+
+SESSION_MAX_IDLE_DAYS = 60
+MIN_PASSWORD_LENGTH = 6
 
 # Built-in Google OAuth 2.0 Desktop/Loopback Client for immediate real Google Sign-In on localhost
 DEFAULT_GOOGLE_CLIENT_ID = "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com"
 DEFAULT_GOOGLE_CLIENT_SECRET = "d-FL95Q19q7MQmFpd7hHD0Ty"
-GOOGLE_REDIRECT_URI = "http://localhost:8000/api/auth/google/callback"
+# Public address of the app (e.g. https://vasco.up.railway.app): OAuth providers redirect back to it.
+APP_URL = (os.getenv("APP_URL", "").strip() or "http://localhost:8000").rstrip("/")
+IS_LOCAL = APP_URL.startswith(("http://localhost", "http://127.0.0.1"))
+GOOGLE_REDIRECT_URI = f"{APP_URL}/api/auth/google/callback"
 
 # Built-in GitHub OAuth 2.0 Public Client ID for official GitHub Device Flow (https://github.com/login/device)
 DEFAULT_GITHUB_DEVICE_CLIENT_ID = "178c6fc778ccc68e1d6a"
-GITHUB_REDIRECT_URI = "http://localhost:8000/api/auth/github/callback"
+GITHUB_REDIRECT_URI = f"{APP_URL}/api/auth/github/callback"
+
+
+def can_manage_server_keys(user: Dict[str, Any]) -> bool:
+    """Server API keys are shared by every user: only admins may change them once the app is public."""
+    admins = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+    if admins:
+        return (user.get("email") or "").lower() in admins
+    return IS_LOCAL
 
 # In-memory store for completed OAuth state sessions (survives COOP popup opener severing)
 COMPLETED_OAUTH_STATES: Dict[str, Dict[str, Any]] = {}
-
-
-def _load_db() -> Dict[str, Any]:
-    if not os.path.exists(USERS_DB_PATH):
-        return {"users": {}, "sessions": {}}
-    try:
-        with open(USERS_DB_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if "users" not in data:
-                data["users"] = {}
-            if "sessions" not in data:
-                data["sessions"] = {}
-            return data
-    except Exception:
-        return {"users": {}, "sessions": {}}
-
-
-def _save_db(data: Dict[str, Any]) -> None:
-    with open(USERS_DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def _hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000).hex()
 
 
-def create_session(user: Dict[str, Any]) -> Dict[str, Any]:
-    db = _load_db()
+def verify_password(user_row: Dict[str, Any], password: str) -> bool:
+    expected = user_row.get("password_hash") or ""
+    if not expected:
+        return False
+    return hmac.compare_digest(_hash_password(password, user_row.get("salt") or ""), expected)
+
+
+def set_password(user_id: str, new_password: str) -> None:
+    if len(new_password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"Le mot de passe doit contenir au moins {MIN_PASSWORD_LENGTH} caractères.")
+    salt = secrets.token_hex(16)
+    db.execute(
+        "UPDATE users SET salt=%s, password_hash=%s WHERE id=%s",
+        (salt, _hash_password(new_password, salt), user_id),
+    )
+
+
+def default_avatar(name: str, bg: str = "7c3aed") -> str:
+    return f"https://ui-avatars.com/api/?name={urllib.parse.quote(name)}&background={bg}&color=fff&bold=true"
+
+
+def public_user(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The user fields safe to send to the browser."""
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "email": row["email"],
+        "provider": row.get("provider") or "email",
+        "avatar": row.get("avatar") or default_avatar(row["name"]),
+        "username": row.get("username") or "",
+        "created_at": db.to_ts(row.get("created_at")) or int(time.time()),
+    }
+
+
+def log_activity(user_id: str, kind: str, label: str = "", ip: str = "") -> None:
+    try:
+        db.execute(
+            "INSERT INTO user_activity (user_id, kind, label, ip_address) VALUES (%s,%s,%s,%s)",
+            (user_id, kind, label[:255], ip[:64]),
+        )
+    except db.DatabaseError:
+        pass
+
+
+def get_user_row(user_id: str) -> Optional[Dict[str, Any]]:
+    return db.query_one("SELECT * FROM users WHERE id=%s", (user_id,))
+
+
+def _insert_user(user_id: str, email: str, name: str, provider: str, avatar: str,
+                 username: str = "", provider_uid: str = "", salt: str = "", pwd_hash: str = "") -> None:
+    first, _, last = name.partition(" ")
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO users (id, email, name, username, provider, provider_uid, avatar, salt, password_hash)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (user_id, email, name[:120], username[:80], provider, provider_uid[:64], avatar, salt, pwd_hash),
+        )
+        cur.execute(
+            "INSERT IGNORE INTO user_profiles (user_id, first_name, last_name) VALUES (%s,%s,%s)",
+            (user_id, first[:80], last.strip()[:80]),
+        )
+        cur.execute("INSERT IGNORE INTO user_stats (user_id) VALUES (%s)", (user_id,))
+
+
+def create_session(user: Dict[str, Any], login_method: str = "", user_agent: str = "", ip: str = "") -> Dict[str, Any]:
     token = secrets.token_urlsafe(32)
-    safe_user = {
-        "id": user["id"],
-        "name": user["name"],
-        "email": user["email"],
-        "provider": user.get("provider", "email"),
-        "avatar": user.get("avatar", ""),
-        "username": user.get("username", ""),
-        "created_at": user.get("created_at", int(time.time())),
-    }
-    db["sessions"][token] = {
-        "user_id": user["id"],
-        "created_at": int(time.time()),
-    }
-    _save_db(db)
-    return {"token": token, "user": safe_user}
+    method = login_method or user.get("provider") or "email"
+    db.execute(
+        "INSERT INTO sessions (token, user_id, user_agent, ip_address, login_method) VALUES (%s,%s,%s,%s,%s)",
+        (token, user["id"], (user_agent or "")[:255], (ip or "")[:64], method),
+    )
+    db.execute("UPDATE users SET last_login_at=NOW() WHERE id=%s", (user["id"],))
+    log_activity(user["id"], "login", f"Connexion via {method.capitalize()}", ip)
+    row = get_user_row(user["id"]) or user
+    return {"token": token, "user": public_user(row)}
 
 
-def register_email_user(name: str, email: str, password: str) -> Dict[str, Any]:
+def register_email_user(name: str, email: str, password: str, user_agent: str = "", ip: str = "") -> Dict[str, Any]:
     email_clean = email.strip().lower()
     name_clean = name.strip() or email_clean.split("@")[0].capitalize()
-    if not email_clean or "@" not in email_clean:
+    if not email_clean or "@" not in email_clean or "." not in email_clean.split("@")[-1]:
         raise ValueError("Adresse e-mail invalide.")
-    if len(password) < 4:
-        raise ValueError("Le mot de passe doit contenir au moins 4 caractères.")
-
-    db = _load_db()
-    if email_clean in db["users"]:
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"Le mot de passe doit contenir au moins {MIN_PASSWORD_LENGTH} caractères.")
+    if db.query_one("SELECT id FROM users WHERE email=%s", (email_clean,)):
         raise ValueError("Un compte existe déjà avec cette adresse e-mail. Connectez-vous.")
 
     salt = secrets.token_hex(16)
-    pwd_hash = _hash_password(password, salt)
     user_id = f"usr_{secrets.token_hex(8)}"
-    avatar_url = f"https://ui-avatars.com/api/?name={urllib.parse.quote(name_clean)}&background=2563eb&color=fff&bold=true"
-
-    user_obj = {
-        "id": user_id,
-        "name": name_clean,
-        "email": email_clean,
-        "provider": "email",
-        "avatar": avatar_url,
-        "salt": salt,
-        "password_hash": pwd_hash,
-        "created_at": int(time.time()),
-    }
-    db["users"][email_clean] = user_obj
-    _save_db(db)
-    return create_session(user_obj)
+    _insert_user(user_id, email_clean, name_clean, "email", default_avatar(name_clean),
+                 salt=salt, pwd_hash=_hash_password(password, salt))
+    log_activity(user_id, "register", "Création du compte", ip)
+    return create_session({"id": user_id, "provider": "email"}, "email", user_agent, ip)
 
 
-def login_email_user(email: str, password: str) -> Dict[str, Any]:
+def login_email_user(email: str, password: str, user_agent: str = "", ip: str = "") -> Dict[str, Any]:
     email_clean = email.strip().lower()
-    db = _load_db()
-    user = db["users"].get(email_clean)
+    user = db.query_one("SELECT * FROM users WHERE email=%s", (email_clean,))
     if not user:
         raise ValueError("Aucun compte trouvé avec cet e-mail.")
     if user.get("provider") in ("google", "github") and not user.get("password_hash"):
         raise ValueError(f"Ce compte a été créé via {user['provider'].capitalize()}. Utilisez l'icône {user['provider'].capitalize()}.")
-
-    salt = user.get("salt", "")
-    expected_hash = user.get("password_hash", "")
-    if _hash_password(password, salt) != expected_hash:
+    if not verify_password(user, password):
         raise ValueError("Mot de passe incorrect.")
-
-    return create_session(user)
+    return create_session(user, "email", user_agent, ip)
 
 
 def oauth_upsert_user(
@@ -130,66 +164,51 @@ def oauth_upsert_user(
     """Creates or updates a real user authenticated via Google OAuth 2.0 or GitHub OAuth 2.0."""
     email_clean = email.strip().lower()
     name_clean = name.strip() or username.strip() or email_clean.split("@")[0].capitalize()
-    db = _load_db()
+    existing = db.query_one("SELECT * FROM users WHERE email=%s", (email_clean,))
+
+    if existing:
+        # A photo the user uploaded themselves (data URL) is kept over the provider's picture.
+        keep_avatar = (existing.get("avatar") or "").startswith("data:")
+        db.execute(
+            """UPDATE users SET provider=%s,
+                   avatar=IF(%s OR %s='', avatar, %s),
+                   username=IF(%s='', username, %s),
+                   provider_uid=IF(%s='', provider_uid, %s)
+               WHERE id=%s""",
+            (provider, keep_avatar, avatar, avatar, username, username[:80],
+             provider_uid, provider_uid[:64], existing["id"]),
+        )
+        return create_session(existing, provider)
 
     bg_color = "4285F4" if provider == "google" else "24292F"
-    default_avatar = f"https://ui-avatars.com/api/?name={urllib.parse.quote(name_clean)}&background={bg_color}&color=fff&bold=true"
-
-    if email_clean in db["users"]:
-        user_obj = db["users"][email_clean]
-        user_obj["name"] = name_clean or user_obj.get("name")
-        user_obj["provider"] = provider
-        if avatar:
-            user_obj["avatar"] = avatar
-        if username:
-            user_obj["username"] = username
-        if provider_uid:
-            user_obj["provider_uid"] = provider_uid
-    else:
-        user_obj = {
-            "id": f"usr_{secrets.token_hex(8)}",
-            "name": name_clean,
-            "email": email_clean,
-            "provider": provider,
-            "avatar": avatar or default_avatar,
-            "username": username,
-            "provider_uid": provider_uid,
-            "created_at": int(time.time()),
-        }
-        db["users"][email_clean] = user_obj
-
-    _save_db(db)
-    return create_session(user_obj)
+    user_id = f"usr_{secrets.token_hex(8)}"
+    _insert_user(user_id, email_clean, name_clean, provider, avatar or default_avatar(name_clean, bg_color),
+                 username=username, provider_uid=provider_uid)
+    log_activity(user_id, "register", f"Création du compte via {provider.capitalize()}")
+    return create_session({"id": user_id, "provider": provider}, provider)
 
 
 def get_user_by_token(token: str) -> Optional[Dict[str, Any]]:
     if not token:
         return None
-    db = _load_db()
-    sess = db["sessions"].get(token)
-    if not sess:
+    row = db.query_one(
+        """SELECT u.*, s.last_seen_at AS session_seen FROM sessions s
+           JOIN users u ON u.id = s.user_id
+           WHERE s.token=%s AND s.last_seen_at > NOW() - INTERVAL %s DAY""",
+        (token, SESSION_MAX_IDLE_DAYS),
+    )
+    if not row:
         return None
-    uid = sess.get("user_id")
-    for u in db["users"].values():
-        if u.get("id") == uid:
-            return {
-                "id": u["id"],
-                "name": u["name"],
-                "email": u["email"],
-                "provider": u.get("provider", "email"),
-                "avatar": u.get("avatar", ""),
-                "username": u.get("username", ""),
-            }
-    return None
+    db.execute(
+        "UPDATE sessions SET last_seen_at=NOW() WHERE token=%s AND last_seen_at < NOW() - INTERVAL 5 MINUTE",
+        (token,),
+    )
+    return public_user(row)
 
 
 def logout_token(token: str) -> None:
-    if not token:
-        return
-    db = _load_db()
-    if token in db["sessions"]:
-        del db["sessions"][token]
-        _save_db(db)
+    if token:
+        db.execute("DELETE FROM sessions WHERE token=%s", (token,))
 
 
 # =====================================================================

@@ -1,8 +1,25 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { Suspense, lazy, useState, useEffect, useRef } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import {
+  ArrowUp, ArrowUpRight, AudioLines, Brain, Calculator, Camera, ChevronDown, Code2, Copy, Download, FileText, Globe,
+  Image as ImageIcon, ImagePlus, KeyRound, LogOut, MessageSquare, Mic, MonitorPlay, Moon, Newspaper, PanelLeft,
+  Paperclip, Plus, Search, Sparkles, Sun, Trash2, UploadCloud, UserRound, Wand2, X,
+} from 'lucide-react';
 import AuthPage from './components/AuthPage.jsx';
 import VoiceModeOverlay from './components/VoiceModeOverlay.jsx';
 import AgentMessage from './components/AgentMessage.jsx';
+import VascoLogo from './components/VascoLogo.jsx';
+const ProfilePage = lazy(() => import('./components/profile/ProfilePage.jsx'));
 import { apiFetch, streamAgent } from './lib/api.js';
+import { toolIcon } from './lib/icons.js';
+
+function savePrefs(patch) {
+  apiFetch('/api/profile', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  }).catch(() => {});
+}
 
 // Applies one streamed agent event to an assistant message (returns a new message object).
 function applyAgentEvent(msg, ev) {
@@ -86,6 +103,7 @@ export default function App() {
   };
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
+  const [view, setView] = useState('chat'); // 'chat' | 'profile'
 
   // Models & Providers
   const [providers, setProviders] = useState([]);
@@ -98,6 +116,7 @@ export default function App() {
   );
 
   // Conversations (Scoped per authenticated user)
+  const userId = user?.id;
   const storageKey = user ? `vasco_convs_${user.id}` : 'vasco_conversations';
   const [conversations, setConversations] = useState([]);
   const [currentConvId, setCurrentConvId] = useState(null);
@@ -241,7 +260,42 @@ export default function App() {
     } catch {
       setConversations([]);
     }
-  }, [user]);
+  }, [userId]);
+
+  // Preferences saved in the MySQL profile follow the user across devices.
+  const applyPrefs = (p, { initial = false } = {}) => {
+    if (!p) return;
+    if (p.pref_theme) setTheme(p.pref_theme);
+    setSystemPrompt(p.system_prompt || '');
+    localStorage.setItem('vasco_system_prompt', p.system_prompt || '');
+    setAutoTTS(!!p.pref_auto_tts);
+    localStorage.setItem('vasco_auto_tts', String(!!p.pref_auto_tts));
+    if (p.pref_voice) localStorage.setItem('vasco_voice_gender', p.pref_voice);
+    if (initial) setWebSearch(p.pref_web_search !== false);
+  };
+
+  useEffect(() => {
+    if (!userId) return;
+    apiFetch('/api/profile')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d) return;
+        applyPrefs(d.profile, { initial: true });
+        handleUserUpdate(d.user);
+      })
+      .catch(() => {});
+  }, [userId]);
+
+  const handleUserUpdate = (u) => {
+    if (!u) return;
+    setUser((prev) => {
+      const next = { ...prev, id: u.id, name: u.name, email: u.email, avatar: u.avatar, username: u.username, provider: u.provider };
+      try {
+        localStorage.setItem('vasco_user', JSON.stringify(next));
+      } catch (_) {}
+      return next;
+    });
+  };
 
   // Persist conversations (skipped while streaming; saved once the run ends)
   useEffect(() => {
@@ -262,7 +316,7 @@ export default function App() {
   const stickToBottomRef = useRef(true);
   useEffect(() => {
     const el = chatScrollRef.current;
-    if (!el) return undefined;
+    if (!el || !currentConversation?.messages?.length) return undefined;
     let lastTop = el.scrollTop;
     const onScroll = () => {
       const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
@@ -293,7 +347,7 @@ export default function App() {
     if (!el) return;
     // A new message (sent or received) always brings the view back to the bottom.
     stickToBottomRef.current = true;
-    el.scrollTop = el.scrollHeight;
+    el.scrollTop = currentConversation?.messages?.length ? el.scrollHeight : 0;
   }, [currentConversation?.messages?.length, currentConvId]);
 
   useEffect(() => {
@@ -346,6 +400,7 @@ export default function App() {
 
   const handleLogout = async () => {
     setVoiceModeOpen(false);
+    setView('chat');
     if (activeAudioRef.current) {
       activeAudioRef.current.pause();
       activeAudioRef.current = null;
@@ -375,6 +430,18 @@ export default function App() {
     };
     setConversations((prev) => [newConv, ...prev]);
     setCurrentConvId(newConv.id);
+    setView('chat');
+    closeSidebarOnMobile();
+  };
+
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    setTheme(next);
+    savePrefs({ pref_theme: next });
+  };
+
+  const openProfile = () => {
+    setView('profile');
     closeSidebarOnMobile();
   };
 
@@ -640,6 +707,10 @@ export default function App() {
         body: JSON.stringify(payload),
       });
       const data = await res.json();
+      if (!res.ok) {
+        showToast(`🔒 ${data.detail || 'Modification refusée.'}`);
+        return;
+      }
       if (data.keys_status) setKeysStatus(data.keys_status);
       setKeysModalOpen(false);
       showToast('✅ Clés API enregistrées !');
@@ -696,7 +767,7 @@ export default function App() {
       {isDragging && (
         <div className="drop-overlay" onDragLeave={() => setIsDragging(false)}>
           <div className="drop-card">
-            <div className="drop-icon">📂</div>
+            <div className="drop-icon"><UploadCloud size={40} /></div>
             <h3>Déposez vos fichiers et photos ici</h3>
             <p>Images, PDF, Word (.docx), Code (.py, .js, .html...), CSV, TXT</p>
           </div>
@@ -711,18 +782,7 @@ export default function App() {
         <div className="sidebar-top">
           <div className="brand">
             <div className="brand-logo">
-              <svg viewBox="0 0 36 36" fill="none">
-                <defs>
-                  <linearGradient id="vascoGrad" x1="0" y1="0" x2="36" y2="36" gradientUnits="userSpaceOnUse">
-                    <stop offset="0%" stopColor="#2563eb" />
-                    <stop offset="50%" stopColor="#0891b2" />
-                    <stop offset="100%" stopColor="#14b8a6" />
-                  </linearGradient>
-                </defs>
-                <rect width="36" height="36" rx="10" fill="url(#vascoGrad)" />
-                <path d="M18 6L21.5 14.5L30 18L21.5 21.5L18 30L14.5 21.5L6 18L14.5 14.5L18 6Z" fill="white" />
-                <circle cx="18" cy="18" r="2.5" fill="#2563eb" />
-              </svg>
+              <VascoLogo size={40} />
             </div>
             <div className="brand-text">
               <span className="brand-name">Vasco</span>
@@ -733,11 +793,11 @@ export default function App() {
 
         <div className="sidebar-actions">
           <button className="new-chat-btn" onClick={startNewChat}>
-            <span>＋</span>
+            <Plus size={17} strokeWidth={2.4} />
             <span>Nouvelle conversation</span>
           </button>
           <div className="search-box">
-            <span>🔍</span>
+            <Search size={15} className="search-box-icon" />
             <input
               type="text"
               placeholder="Rechercher une discussion..."
@@ -754,15 +814,17 @@ export default function App() {
             .map((conv) => (
               <div
                 key={conv.id}
-                className={`conv-item ${conv.id === currentConversation?.id ? 'active' : ''}`}
+                className={`conv-item ${conv.id === currentConversation?.id && view === 'chat' ? 'active' : ''}`}
                 onClick={() => {
                   setCurrentConvId(conv.id);
+                  setView('chat');
                   closeSidebarOnMobile();
                 }}
               >
-                <span className="conv-title">💬 {conv.title}</span>
+                <MessageSquare size={15} className="conv-icon" />
+                <span className="conv-title">{conv.title}</span>
                 <button className="conv-delete-btn" onClick={(e) => deleteConv(conv.id, e)} title="Supprimer">
-                  ✕
+                  <Trash2 size={14} />
                 </button>
               </div>
             ))}
@@ -770,30 +832,8 @@ export default function App() {
 
         {/* Sidebar Footer with Authenticated User Profile & Logout */}
         <div className="sidebar-footer">
-          <div className="sidebar-user-card">
-            <img
-              src={
-                user.avatar ||
-                `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name)}&background=2563eb&color=fff`
-              }
-              alt={user.name}
-              className="user-avatar-img"
-            />
-            <div className="user-card-info">
-              <strong>{user.name}</strong>
-              <small>{user.email}</small>
-            </div>
-            <button className="logout-icon-btn" onClick={handleLogout} title="Se déconnecter (Logout)">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-                <polyline points="16 17 21 12 16 7" />
-                <line x1="21" y1="12" x2="9" y2="12" />
-              </svg>
-            </button>
-          </div>
-
           <button className="footer-btn" onClick={() => setKeysModalOpen(true)}>
-            <span>🔑</span>
+            <span className="footer-btn-icon"><KeyRound size={16} /></span>
             <div className="footer-btn-text">
               <strong>Clés API & Modèles</strong>
               <small>Vasco, Gemini, ChatGPT, Ollama</small>
@@ -801,7 +841,7 @@ export default function App() {
           </button>
 
           <button className="footer-btn" onClick={() => setPersonaModalOpen(true)}>
-            <span>🎭</span>
+            <span className="footer-btn-icon"><Wand2 size={16} /></span>
             <div className="footer-btn-text">
               <strong>Personnaliser Vasco</strong>
               <small>Instructions & Voix</small>
@@ -809,11 +849,9 @@ export default function App() {
           </button>
 
           <div className="footer-bottom-row">
-            <button
-              className="footer-mini-btn"
-              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-            >
-              {theme === 'dark' ? '🌙 Sombre' : '☀️ Clair'}
+            <button className="footer-mini-btn" onClick={toggleTheme}>
+              {theme === 'dark' ? <Moon size={14} /> : <Sun size={14} />}
+              {theme === 'dark' ? 'Sombre' : 'Clair'}
             </button>
             <button
               className="footer-mini-btn danger-hover"
@@ -822,42 +860,93 @@ export default function App() {
                 setConversations((prev) => [prev[0]]);
               }}
             >
-              🗑️ Effacer
+              <Trash2 size={14} /> Effacer
+            </button>
+          </div>
+
+          <div
+            className={`sidebar-user-card ${view === 'profile' ? 'active' : ''}`}
+            role="button"
+            tabIndex={0}
+            onClick={openProfile}
+            onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && openProfile()}
+            title="Mon profil"
+          >
+            <img
+              src={
+                user.avatar ||
+                `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name)}&background=7c3aed&color=fff`
+              }
+              alt={user.name}
+              className="user-avatar-img"
+              referrerPolicy="no-referrer"
+            />
+            <div className="user-card-info">
+              <strong>{user.name}</strong>
+              <small>{user.username ? `@${user.username}` : user.email}</small>
+            </div>
+            <button
+              className="logout-icon-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleLogout();
+              }}
+              title="Se déconnecter"
+            >
+              <LogOut size={17} />
             </button>
           </div>
         </div>
       </aside>
 
+      {/* ================= PROFILE SPACE ================= */}
+      {view === 'profile' && (
+        <Suspense fallback={<div className="pf-page" />}>
+          <ProfilePage
+            user={user}
+            onClose={() => setView('chat')}
+            onUserUpdate={handleUserUpdate}
+            onPrefsChange={(p) => applyPrefs(p)}
+            onLogout={handleLogout}
+            showToast={showToast}
+            conversationsCount={conversations.filter((c) => c.messages.length > 0).length}
+          />
+        </Suspense>
+      )}
+
       {/* ================= MAIN CHAT AREA ================= */}
-      <main className="main-area">
+      <main className="main-area" style={view === 'profile' ? { display: 'none' } : undefined}>
         <header className="top-header">
           <div className="header-left">
-            <button className="icon-btn" onClick={() => setSidebarCollapsed(!sidebarCollapsed)}>
-              ☰
+            <button className="icon-btn" onClick={() => setSidebarCollapsed(!sidebarCollapsed)} title="Afficher / masquer le menu">
+              <PanelLeft size={18} />
             </button>
-
+            <div className="header-title">
+              <span className="header-title-mark"><VascoLogo size={26} /></span>
+              <span className="header-title-text">{currentConversation?.messages?.length ? currentConversation.title : 'Vasco Agent'}</span>
+              {isGenerating && <span className="header-live-dot" title="Génération en cours" />}
+            </div>
           </div>
 
           <div className="header-right">
             <button className="header-pill-btn" onClick={() => setKeysModalOpen(true)}>
-              <span>🔑</span>
+              <KeyRound size={15} />
               <span className="hide-sm">Clés API</span>
             </button>
-            <button className="header-pill-btn" onClick={() => setCanvasOpen(!canvasOpen)}>
-              <span>🖥️</span>
+            <button className={`header-pill-btn ${canvasOpen ? 'is-active' : ''}`} onClick={() => setCanvasOpen(!canvasOpen)}>
+              <MonitorPlay size={15} />
               <span className="hide-sm">Canvas</span>
             </button>
             <button className="header-pill-btn" onClick={handleExportChat}>
-              <span>📥</span>
+              <Download size={15} />
               <span className="hide-sm">Exporter</span>
             </button>
-            <button className="header-pill-btn logout-pill-btn" onClick={handleLogout} title="Se déconnecter">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-                <polyline points="16 17 21 12 16 7" />
-                <line x1="21" y1="12" x2="9" y2="12" />
-              </svg>
-              <span className="hide-sm">Logout</span>
+            <button className="header-avatar-btn" onClick={openProfile} title="Mon profil">
+              <img
+                src={user.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name)}&background=7c3aed&color=fff`}
+                alt=""
+                referrerPolicy="no-referrer"
+              />
             </button>
           </div>
         </header>
@@ -866,95 +955,86 @@ export default function App() {
         <div ref={chatScrollRef} className="chat-scroll-container" onClick={handleChatClick}>
           {!currentConversation || currentConversation.messages.length === 0 ? (
             <div className="welcome-screen">
-              <div className="welcome-hero">
-                <div className="welcome-orb">
-                  <svg viewBox="0 0 48 48" fill="none">
-                    <path d="M24 6L29 19L42 24L29 29L24 42L19 29L6 24L19 19L24 6Z" fill="url(#orbGrad)" />
-                    <defs>
-                      <linearGradient id="orbGrad" x1="6" y1="6" x2="42" y2="42" gradientUnits="userSpaceOnUse">
-                        <stop offset="0%" stopColor="#60a5fa" />
-                        <stop offset="50%" stopColor="#22d3ee" />
-                        <stop offset="100%" stopColor="#2dd4bf" />
-                      </linearGradient>
-                    </defs>
-                  </svg>
+              <motion.div
+                className="welcome-hero"
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+              >
+                <motion.div
+                  className="welcome-logo-wrap"
+                  animate={{ y: [0, -8, 0], rotateZ: [0, -2, 0] }}
+                  transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
+                >
+                  <span className="welcome-logo-orbit" />
+                  <VascoLogo size={isMobile ? 92 : 118} />
+                </motion.div>
+                <div className="welcome-badge">
+                  <Sparkles size={13} /> Agent autonome · Web · Outils · Voix
                 </div>
                 <h1>
-                  Bonjour {user.name.split(' ')[0]}, je suis <span className="gradient-text">Vasco</span>
+                  Bonjour {user.name.split(' ')[0]}, je suis <span className="serif-accent">Vasco</span>
                 </h1>
                 <p className="welcome-subtitle">
                   Un agent autonome qui <strong>cherche sur le Web, lit les sources, calcule et crée</strong> avant de
                   vous répondre — en <strong>Français, Darija, Arabe ou Anglais</strong>. Chaque étape est visible en direct.
                 </p>
-              </div>
+              </motion.div>
 
               <div className="starter-grid">
-                <button
-                  className="starter-card"
-                  onClick={() =>
-                    handleSendMessage(
-                      "Fais une recherche approfondie : quelles sont les dernières avancées des voitures électriques en 2026 ? Compare 3 modèles (prix, autonomie) dans un tableau avec les sources."
-                    )
-                  }
-                >
-                  <div className="starter-icon">🔎</div>
-                  <div className="starter-content">
-                    <h3>Recherche approfondie</h3>
-                    <p>L’agent cherche, lit plusieurs sources et compare dans un tableau sourcé</p>
-                  </div>
-                </button>
-
-                <button
-                  className="starter-card"
-                  onClick={() =>
-                    handleSendMessage(
-                      "J'emprunte 250 000 MAD sur 20 ans à 4,2 % par an. Calcule la mensualité exacte et le coût total du crédit."
-                    )
-                  }
-                >
-                  <div className="starter-icon">🧮</div>
-                  <div className="starter-content">
-                    <h3>Calculs exacts</h3>
-                    <p>Crédit, pourcentages, conversions : calculés avec des outils, pas devinés</p>
-                  </div>
-                </button>
-
-                <button
-                  className="starter-card"
-                  onClick={() =>
-                    handleSendMessage(
-                      'سلام خويا فاسكو! شنو هي أهم الأخبار لي واقعة اليوم فالمغرب وفالعالم؟'
-                    )
-                  }
-                >
-                  <div className="starter-icon">🇲🇦</div>
-                  <div className="starter-content">
-                    <h3>الدارجة المغربية & أخبار اليوم</h3>
-                    <p>هضر مع فاسكو بالدارجة أو سولو على أي خبر جديد فالمغرب والعالم</p>
-                  </div>
-                </button>
-
-                <button
-                  className="starter-card"
-                  onClick={() =>
-                    handleSendMessage(
-                      'Crée une application complète de Pomodoro & To-Do List au design futuriste en un seul fichier HTML/CSS/JS interactif.'
-                    )
-                  }
-                >
-                  <div className="starter-icon">💻</div>
-                  <div className="starter-content">
-                    <h3>Coder & Prévisualiser en direct</h3>
-                    <p>Générer une interface web HTML/CSS/JS et la tester dans le Canvas</p>
-                  </div>
-                </button>
+                {[
+                  {
+                    icon: Search, tone: 'blue', title: 'Recherche approfondie',
+                    desc: 'L’agent cherche, lit plusieurs sources et compare dans un tableau sourcé',
+                    prompt: "Fais une recherche approfondie : quelles sont les dernières avancées des voitures électriques en 2026 ? Compare 3 modèles (prix, autonomie) dans un tableau avec les sources.",
+                  },
+                  {
+                    icon: Calculator, tone: 'teal', title: 'Calculs exacts',
+                    desc: 'Crédit, pourcentages, conversions : calculés avec des outils, pas devinés',
+                    prompt: "J'emprunte 250 000 MAD sur 20 ans à 4,2 % par an. Calcule la mensualité exacte et le coût total du crédit.",
+                  },
+                  {
+                    icon: Newspaper, tone: 'amber', title: 'الدارجة المغربية & أخبار اليوم', rtl: true,
+                    desc: 'هضر مع فاسكو بالدارجة أو سولو على أي خبر جديد فالمغرب والعالم',
+                    prompt: 'سلام خويا فاسكو! شنو هي أهم الأخبار لي واقعة اليوم فالمغرب وفالعالم؟',
+                  },
+                  {
+                    icon: Code2, tone: 'violet', title: 'Coder & Prévisualiser en direct',
+                    desc: 'Générer une interface web HTML/CSS/JS et la tester dans le Canvas',
+                    prompt: 'Crée une application complète de Pomodoro & To-Do List au design futuriste en un seul fichier HTML/CSS/JS interactif.',
+                  },
+                ].map((s, i) => (
+                  <motion.button
+                    key={s.title}
+                    className={`starter-card tone-${s.tone}`}
+                    onClick={() => handleSendMessage(s.prompt)}
+                    initial={{ opacity: 0, y: 14 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.15 + i * 0.07, duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+                    whileHover={{ y: -3 }}
+                    whileTap={{ scale: 0.98 }}
+                  >
+                    <ArrowUpRight size={17} className="starter-arrow" />
+                    <div className="starter-icon"><s.icon size={19} /></div>
+                    <div className="starter-content" dir={s.rtl ? 'rtl' : undefined}>
+                      <h3>{s.title}</h3>
+                      <p>{s.desc}</p>
+                    </div>
+                  </motion.button>
+                ))}
               </div>
             </div>
           ) : (
             <div className="messages-list">
               {currentConversation.messages.map((msg, idx) => (
                 <div key={idx} className={`message-row ${msg.role}`}>
-                  <div className="msg-avatar">{msg.role === 'user' ? '👤' : '✦'}</div>
+                  <div className="msg-avatar">
+                    {msg.role === 'user' ? (
+                      user.avatar ? <img src={user.avatar} alt="" referrerPolicy="no-referrer" /> : <UserRound size={17} />
+                    ) : (
+                      <VascoLogo size={32} />
+                    )}
+                  </div>
                   <div className="msg-content-wrapper">
                     <div className="msg-header">
                       <strong>{msg.role === 'user' ? user.name : 'Vasco'}</strong>
@@ -979,7 +1059,7 @@ export default function App() {
                             />
                           ) : (
                             <div key={i} className="msg-file-chip">
-                              <span>{att.category === 'pdf' ? '📕' : '📄'}</span>
+                              <FileText size={15} />
                               <strong>{att.filename}</strong>
                               <small>({att.size_human})</small>
                             </div>
@@ -998,10 +1078,10 @@ export default function App() {
                             className="msg-action-btn"
                             onClick={() => {
                               navigator.clipboard.writeText(msg.content || '');
-                              showToast('📋 Copié !');
+                              showToast('Copié dans le presse-papiers');
                             }}
                           >
-                            📋 Copier
+                            <Copy size={14} /> <span>Copier</span>
                           </button>
                         </div>
                       </>
@@ -1009,10 +1089,7 @@ export default function App() {
                       <AgentMessage
                         msg={msg}
                         isLast={idx === currentConversation.messages.length - 1}
-                        onCopy={(text) => {
-                          navigator.clipboard.writeText(text || '');
-                          showToast('📋 Copié !');
-                        }}
+                        onCopy={(text) => navigator.clipboard.writeText(text || '')}
                         onSpeak={handleSpeakText}
                         onRegenerate={isGenerating ? null : handleRegenerate}
                         onOpenImage={setLightboxSrc}
@@ -1035,7 +1112,7 @@ export default function App() {
                     {att.category === 'image' && att.data_url ? (
                       <img src={att.data_url} className="att-thumb" alt={att.filename} />
                     ) : (
-                      <div className="att-icon-box">{att.category === 'pdf' ? '📕' : '📄'}</div>
+                      <div className="att-icon-box"><FileText size={18} /></div>
                     )}
                     <div className="att-meta">
                       <span className="att-name">{att.filename}</span>
@@ -1048,7 +1125,7 @@ export default function App() {
                         setPendingAttachments((prev) => prev.filter((_, i) => i !== idx))
                       }
                     >
-                      ✕
+                      <X size={12} />
                     </button>
                   </div>
                 ))}
@@ -1113,24 +1190,26 @@ export default function App() {
 
                 <button
                   type="button"
-                  className="tool-pill"
+                  className="tool-pill icon-only-sm"
                   onClick={() => fileInputRef.current?.click()}
+                  title="Joindre un fichier"
                 >
-                  <span>📎</span>
+                  <Paperclip size={15} />
                   <span>Fichier</span>
                 </button>
 
                 <button
                   type="button"
-                  className="tool-pill"
+                  className="tool-pill icon-only-sm"
                   onClick={() => photoInputRef.current?.click()}
+                  title="Joindre une photo"
                 >
-                  <span>🖼️</span>
+                  <ImageIcon size={15} />
                   <span>Photo</span>
                 </button>
 
-                <button type="button" className="tool-pill" onClick={openCamera}>
-                  <span>📷</span>
+                <button type="button" className="tool-pill icon-only-sm" onClick={openCamera} title="Prendre une photo">
+                  <Camera size={15} />
                   <span className="hide-xs">Caméra</span>
                 </button>
 
@@ -1141,8 +1220,9 @@ export default function App() {
                   id="deepthink-toggle"
                   className={`tool-pill toggle-pill ${deepThink ? 'active' : ''}`}
                   onClick={() => setDeepThink(!deepThink)}
+                  title="Réflexion approfondie"
                 >
-                  <span>🧠</span>
+                  <Brain size={15} />
                   <span>Think</span>
                 </button>
 
@@ -1151,8 +1231,9 @@ export default function App() {
                   id="websearch-toggle"
                   className={`tool-pill toggle-pill ${webSearch ? 'active' : ''}`}
                   onClick={() => setWebSearch(!webSearch)}
+                  title="Recherche Web en direct"
                 >
-                  <span>🌐</span>
+                  <Globe size={15} />
                   <span>Web Live</span>
                 </button>
 
@@ -1161,8 +1242,9 @@ export default function App() {
                   id="imagegen-toggle"
                   className={`tool-pill toggle-pill ${imageGen ? 'active' : ''}`}
                   onClick={() => setImageGen(!imageGen)}
+                  title="Créer une image"
                 >
-                  <span>🎨</span>
+                  <ImagePlus size={15} />
                   <span className="hide-xs">Créer Image</span>
                 </button>
               </div>
@@ -1188,7 +1270,7 @@ export default function App() {
                         {activeModObj?.badge || 'Temps Réel'}
                       </span>
                     </div>
-                    <span className="chevron">▾</span>
+                    <ChevronDown size={14} className={`chevron ${modelDropdownOpen ? 'open' : ''}`} />
                   </button>
 
                   {modelDropdownOpen && (
@@ -1272,40 +1354,51 @@ export default function App() {
                   onClick={() => setVoiceModeOpen(true)}
                   title="Parler avec Vasco"
                 >
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                    <line x1="12" x2="12" y1="19" y2="22" />
-                  </svg>
+                  <Mic size={19} />
                 </button>
 
-                {/* Blue Voice Mode Wave Circle Button (Like ChatGPT Screenshot) */}
+                {/* Live voice conversation */}
                 <button
                   type="button"
                   className="voice-wave-btn"
                   onClick={() => setVoiceModeOpen(true)}
                   title="Conversation vocale en direct avec Vasco"
                 >
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-                    <path d="M4 10V14" stroke="white" strokeWidth="2.4" strokeLinecap="round" />
-                    <path d="M8 7V17" stroke="white" strokeWidth="2.4" strokeLinecap="round" />
-                    <path d="M12 4V20" stroke="white" strokeWidth="2.4" strokeLinecap="round" />
-                    <path d="M16 8V16" stroke="white" strokeWidth="2.4" strokeLinecap="round" />
-                    <path d="M20 10V14" stroke="white" strokeWidth="2.4" strokeLinecap="round" />
-                  </svg>
+                  <AudioLines size={20} color="white" />
                 </button>
 
-                {isGenerating ? (
-                  <button type="button" className="send-btn stop-btn" onClick={handleStop} title="Arrêter la génération">
-                    <span className="stop-square" />
-                  </button>
-                ) : (
-                  (promptText.trim().length > 0 || pendingAttachments.length > 0) && (
-                    <button type="button" className="send-btn" onClick={() => handleSendMessage()} title="Envoyer">
-                      ➤
-                    </button>
-                  )
-                )}
+                <AnimatePresence mode="popLayout" initial={false}>
+                  {isGenerating ? (
+                    <motion.button
+                      key="stop"
+                      type="button"
+                      className="send-btn stop-btn"
+                      onClick={handleStop}
+                      title="Arrêter la génération"
+                      initial={{ scale: 0.6, opacity: 0 }}
+                      animate={{ scale: 1, opacity: 1 }}
+                      exit={{ scale: 0.6, opacity: 0 }}
+                    >
+                      <span className="stop-square" />
+                    </motion.button>
+                  ) : (
+                    (promptText.trim().length > 0 || pendingAttachments.length > 0) && (
+                      <motion.button
+                        key="send"
+                        type="button"
+                        className="send-btn"
+                        onClick={() => handleSendMessage()}
+                        title="Envoyer"
+                        initial={{ scale: 0.6, opacity: 0, rotate: -45 }}
+                        animate={{ scale: 1, opacity: 1, rotate: 0 }}
+                        exit={{ scale: 0.6, opacity: 0 }}
+                        whileTap={{ scale: 0.9 }}
+                      >
+                        <ArrowUp size={19} strokeWidth={2.6} />
+                      </motion.button>
+                    )
+                  )}
+                </AnimatePresence>
               </div>
             </div>
           </div>
@@ -1314,18 +1407,21 @@ export default function App() {
               <strong>Agent</strong>
               {agentTools
                 .filter((t) => t.enabled && (webSearch || !['web_search', 'fetch_url'].includes(t.name)))
-                .map((t) => (
-                  <span key={t.name} className="agent-tool-chip" title={t.label}>
-                    {t.icon} {t.label}
-                  </span>
-                ))}
+                .map((t) => {
+                  const Icon = toolIcon(t.name);
+                  return (
+                    <span key={t.name} className="agent-tool-chip" title={t.label}>
+                      <Icon size={11} /> {t.label}
+                    </span>
+                  );
+                })}
             </span>
           </div>
         </div>
       </main>
 
       {/* ================= LIVE CODE CANVAS DRAWER ================= */}
-      {canvasOpen && (
+      {canvasOpen && view === 'chat' && (
         <aside className="canvas-drawer">
           <div className="canvas-header">
             <div className="canvas-title">
@@ -1467,6 +1563,7 @@ export default function App() {
                 onClick={() => {
                   localStorage.setItem('vasco_system_prompt', systemPrompt);
                   localStorage.setItem('vasco_auto_tts', String(autoTTS));
+                  savePrefs({ system_prompt: systemPrompt, pref_auto_tts: autoTTS });
                   setPersonaModalOpen(false);
                   showToast('✅ Préférences enregistrées !');
                 }}
@@ -1512,11 +1609,21 @@ export default function App() {
 
       {/* Toasts */}
       <div className="toast-container">
-        {toasts.map((t) => (
-          <div key={t.id} className="toast">
-            {t.msg}
-          </div>
-        ))}
+        <AnimatePresence>
+          {toasts.map((t) => (
+            <motion.div
+              key={t.id}
+              layout
+              className="toast"
+              initial={{ opacity: 0, y: 16, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.96 }}
+              transition={{ type: 'spring', stiffness: 420, damping: 32 }}
+            >
+              {t.msg}
+            </motion.div>
+          ))}
+        </AnimatePresence>
       </div>
     </div>
   );

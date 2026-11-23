@@ -1,0 +1,49 @@
+# Vasco on your own server (VPS): MySQL + the app + Caddy (automatic HTTPS).
+# Usage: docker compose up -d --build   (needs DOMAIN and MYSQL_PASSWORD in .env)
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:?Définissez MYSQL_PASSWORD dans .env}
+      MYSQL_DATABASE: Vasco
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MYSQL_URL: ""
+      MYSQL_HOST: db
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_DATABASE: Vasco
+      PORT: "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?Définissez DOMAIN dans .env (ex. vasco.mondomaine.com)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - app
+
+volumes:
+  mysql_data:
+  caddy_data:
