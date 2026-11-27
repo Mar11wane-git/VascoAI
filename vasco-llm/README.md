@@ -13,9 +13,9 @@ Vasco LLM howa **modèle open-source (Qwen3 4B Instruct, licence Apache 2.0)** l
 | 0 | PC | `python vasco-llm/create_ollama_model.py`, ya3ni **v0** : modèle de base + chakhsiyat Vasco, bla training. Kayban f Vasco → menu → « Vasco LLM ». |
 | 1 | PC | Kteb l-data f `data/mes_donnees.csv` (question, reponse). Wla 7ett lot dyal as2ila w ajwiba f `data/lotN.txt` (b format « 12. sou2al؟ jawab ») w lanci `python vasco-llm/txt_to_csv.py`. Ila 3endek mo7adathat kamlin, dirhom f `data/*.jsonl` (`{"messages": [...]}`). |
 | 2 | PC | `python vasco-llm/prepare_data.py --hf --hf-max 1500` : data dyalek + 1500 exemple darija libre. Kaykhrej `build/train.jsonl` w `build/eval.jsonl`. Ma tkebberch `--hf-max` bzaf, sinon Vasco ywelli ghir kaytarjem. |
-| 3 | Kaggle | **Automatique :** 7ett `kaggle.json` f `C:\Users\<nta>\.kaggle\`, men b3d `python vasco-llm/kaggle_train.py`. Kaysift data, kaytrainer f GPU T4 (≈ 1 h), w kay-installi **vasco:v1** f Ollama. **Yadawi :** sift `build/` k dataset **vasco-data** w lanci `train_vasco.ipynb` b GPU T4. |
-| 4 | PC | (Ghir f l-mode yadawi.) Telecharger l-`.gguf`, men b3d `python vasco-llm/create_ollama_model.py --gguf fichier.gguf --name vasco:v1`. |
-| 5 | PC | `python vasco-llm/eval_compare.py --models vasco:v1 vasco qwen3:4b-instruct`, men b3d 7el `eval/resultats.html` w 3ti notes. |
+| 3 | Kaggle | **Automatique :** 7ett `kaggle.json` f `C:\Users\<nta>\.kaggle\`, men b3d `python vasco-llm/kaggle_train.py`. Kaysift data, kaytrainer f GPU T4 (≈ 1 h), w kay-installi **mr1:v1** (MR1 v1) f Ollama. **Yadawi :** sift `build/` k dataset **vasco-data** w lanci `train_vasco.ipynb` b GPU T4. |
+| 4 | PC | (Ghir f l-mode yadawi.) Telecharger l-`.gguf`, men b3d `python vasco-llm/create_ollama_model.py --gguf fichier.gguf --name mr1:v1`. |
+| 5 | PC | `python vasco-llm/eval_compare.py --models mr1:v1 vasco qwen3:4b-instruct`, men b3d 7el `eval/resultats.html` w 3ti notes. |
 
 ## L-data : 9awa3id mohimma
 

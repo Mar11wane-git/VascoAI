@@ -287,6 +287,17 @@ async def _installed_ollama_models() -> Optional[List[Dict[str, Any]]]:
     return models
 
 
+HOME_MODEL_FAMILIES = ("vasco", "mr1")  # Ollama names of the home-trained models (v0 = vasco, trained = mr1:vN)
+
+
+def _home_model_label(model_id: str) -> str:
+    """'mr1:v1' -> 'MR1 v1'; 'vasco:latest' -> 'Vasco LLM — vasco:latest'."""
+    family, _, tag = model_id.partition(":")
+    if family == "mr1":
+        return f"MR1 {tag}" if tag and tag != "latest" else "MR1"
+    return f"Vasco LLM — {model_id}"
+
+
 @app.get("/api/models")
 async def list_models():
     """Returns all supported AI providers, models, and current API key status.
@@ -299,15 +310,17 @@ async def list_models():
             if installed:
                 p["models"] = installed
         elif p["id"] == "vasco_llm":
-            # Every installed version (vasco, vasco:v1, ...) when served locally by Ollama.
+            # Every installed version (vasco, mr1:v1, ...) when served locally by Ollama.
             local = [
-                {**m, "name": f"Vasco LLM — {m['id']}", "badge": "Modèle maison • Darija • " + m["badge"]}
-                for m in (installed or []) if m["id"].split(":")[0] == "vasco"
+                {**m, "name": _home_model_label(m["id"]), "badge": "Modèle maison • Darija • " + m["badge"]}
+                for m in (installed or []) if m["id"].split(":")[0] in HOME_MODEL_FAMILIES
             ]
             p["running"] = bool(os.getenv("VASCO_LLM_URL", "").strip()) or bool(local)
             if local and not os.getenv("VASCO_LLM_URL", "").strip():
                 p["models"] = local
-    providers = [p for p in providers if p["id"] != "vasco_llm" or p.get("running")]
+    # Local engines only show up where they can be reached (never on the Vercel deployment):
+    # picking one would otherwise fail with "Impossible de joindre Ollama".
+    providers = [p for p in providers if p["id"] not in ("vasco_llm", "ollama") or p.get("running")]
     return {
         "providers": providers,
         "keys_status": get_api_keys_status(),

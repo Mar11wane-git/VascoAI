@@ -139,13 +139,13 @@ def download(user: str, name: str, ok: bool) -> None:
     print(f"Installation dans Ollama sous le nom {name} : {gguf}")
     subprocess.run([sys.executable, os.path.join(HERE, "create_ollama_model.py"), "--gguf", gguf, "--name", name],
                    check=True)
-    print(f"\nTerminé. Comparez : python vasco-llm/eval_compare.py --models {name} vasco qwen3:4b-instruct")
+    print(f"\nTerminé. Comparez : python vasco-llm/eval_compare.py --models {name} qwen3:4b-instruct")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--user", default="", help="Nom d'utilisateur Kaggle (sinon lu dans kaggle.json)")
-    ap.add_argument("--name", default="vasco:v1", help="Nom du modèle dans Ollama (défaut vasco:v1)")
+    ap.add_argument("--name", default="mr1:v1", help="Nom du modèle dans Ollama (défaut mr1:v1)")
     ap.add_argument("--resume", action="store_true", help="Ne rien renvoyer : attendre/télécharger le dernier run")
     args = ap.parse_args()
     user = username(args.user)

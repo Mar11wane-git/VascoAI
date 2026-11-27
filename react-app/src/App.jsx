@@ -412,7 +412,9 @@ export default function App() {
         setSelectedModel('openai');
         localStorage.setItem('vasco_provider', 'vasco_free');
         localStorage.setItem('vasco_model', 'openai');
-        showToast(`⚡ ${prov?.name?.replace(/^\S+\s*/, '') || savedProvider} n'a pas de clé API : passage au moteur gratuit Vasco Cloud.`);
+        showToast(prov
+          ? `⚡ ${prov.name.replace(/^\S+\s*/, '')} n'a pas de clé API : passage au moteur gratuit Vasco Cloud.`
+          : '⚡ Ce modèle local (Ollama) n\'est pas disponible ici : passage au moteur gratuit Vasco Cloud.');
       }
       if (data.keys_status?.OLLAMA_BASE_URL?.value) {
         setKeyInputs((prev) => ({
