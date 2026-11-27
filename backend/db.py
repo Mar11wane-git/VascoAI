@@ -181,7 +181,7 @@ def _alive(conn: Any) -> bool:
                 return False
             conn.execute("SELECT 1")  # hosted servers drop idle connections
         else:
-            conn.ping(reconnect=True)
+            conn.ping()  # a dead connection fails here and the caller opens a new one
         return True
     except DRIVER_ERRORS:
         return False
@@ -377,6 +377,20 @@ SCHEMA = [
         CONSTRAINT fk_activity_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
+    """
+    CREATE TABLE IF NOT EXISTS conversations (
+        user_id     VARCHAR(32)  NOT NULL,
+        id          VARCHAR(64)  NOT NULL,
+        title       VARCHAR(200) NOT NULL DEFAULT '',
+        data        MEDIUMTEXT   NULL,
+        created_ms  BIGINT       NOT NULL DEFAULT 0,
+        updated_ms  BIGINT       NOT NULL DEFAULT 0,
+        deleted     TINYINT(1)   NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, id),
+        INDEX idx_conversations_updated (user_id, updated_ms),
+        CONSTRAINT fk_conversations_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
 ]
 
 
@@ -476,6 +490,19 @@ PG_SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_activity_user ON user_activity (user_id, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS conversations (
+        user_id     VARCHAR(32)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        id          VARCHAR(64)  NOT NULL,
+        title       VARCHAR(200) NOT NULL DEFAULT '',
+        data        TEXT         NULL,
+        created_ms  BIGINT       NOT NULL DEFAULT 0,
+        updated_ms  BIGINT       NOT NULL DEFAULT 0,
+        deleted     SMALLINT     NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations (user_id, updated_ms)",
 ]
 
 

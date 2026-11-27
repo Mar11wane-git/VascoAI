@@ -16,3 +16,6 @@ Procfile
 *.bat
 .env.*
 .vercel/
+tests/
+.github/
+deploy.ps1

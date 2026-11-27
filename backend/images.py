@@ -3,8 +3,8 @@ AI images through a small server-side proxy (/api/image), used by generate_image
 
 - With POLLINATIONS_API_KEY (free account at enter.pollinations.ai): fast images from the keyed API, the key
   never leaves the server.
-- Without a key: the anonymous Pollinations endpoint (about one image every 45 s per IP); the proxy waits and
-  retries when told to.
+- Without a key, or when the keyed API fails (pollen used up, key revoked, outage): the anonymous Pollinations
+  endpoint (about one image every 45 s per IP); the proxy waits and retries when told to.
 
 Image URLs are signed, so the proxy cannot be used by others to spend the key on arbitrary prompts.
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 import os
 import re
 import urllib.parse
@@ -21,6 +22,7 @@ from typing import Tuple
 import httpx
 
 MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
+log = logging.getLogger("vasco.images")
 
 
 class ImageError(Exception):
@@ -55,14 +57,19 @@ async def fetch_image(prompt: str, width: int, height: int, seed: int) -> Tuple[
     key = _key()
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
         if key:
-            r = await client.get(
-                f"https://gen.pollinations.ai/image/{quoted}",
-                params={"model": MODEL, "width": width, "height": height, "seed": seed, "nologo": "true"},
-                headers={"Authorization": f"Bearer {key}"},
-            )
-            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
-                return r.content, r.headers["content-type"]
-            raise ImageError(f"Pollinations {r.status_code}: {r.text[:200]}", 429 if r.status_code in (402, 429) else 502)
+            try:
+                r = await client.get(
+                    f"https://gen.pollinations.ai/image/{quoted}",
+                    params={"model": MODEL, "width": width, "height": height, "seed": seed, "nologo": "true"},
+                    headers={"Authorization": f"Bearer {key}"},
+                )
+                if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
+                    return r.content, r.headers["content-type"]
+                # Out of pollen, revoked key, outage…: fall back to the anonymous endpoint (slower, still free).
+                log.warning("Keyed Pollinations image failed (%s): %s — falling back to anonymous",
+                            r.status_code, r.text[:120])
+            except httpx.HTTPError as e:
+                log.warning("Keyed Pollinations image error (%s) — falling back to anonymous", e)
 
         url = (f"https://image.pollinations.ai/prompt/{quoted}"
                f"?width={width}&height={height}&seed={seed}&nologo=true")

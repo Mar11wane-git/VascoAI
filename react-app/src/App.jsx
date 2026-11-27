@@ -11,6 +11,7 @@ import AgentMessage from './components/AgentMessage.jsx';
 import VascoLogo from './components/VascoLogo.jsx';
 const ProfilePage = lazy(() => import('./components/profile/ProfilePage.jsx'));
 import { apiFetch, streamAgent } from './lib/api.js';
+import { deleteRemote, fetchRemote, loadSynced, mergeConversations, pushChanged, saveSynced } from './lib/convSync.js';
 import { toolIcon } from './lib/icons.js';
 
 function savePrefs(patch) {
@@ -239,27 +240,46 @@ export default function App() {
     fetchModelsAndKeys();
   }, []);
 
-  // Load conversations when user logs in
+  // Load conversations when user logs in: this device's copy first, then merged with the account's.
+  const syncedRef = useRef({}); // convId -> fingerprint of the version the server has
+  const syncReadyRef = useRef(false);
+  const pushTimerRef = useRef(null);
+  const pushingRef = useRef(false);
   useEffect(() => {
-    if (!user) return;
+    if (!user) return undefined;
+    syncReadyRef.current = false;
+    syncedRef.current = loadSynced(userId);
+    let local = [];
     try {
-      const saved = JSON.parse(localStorage.getItem(storageKey) || '[]');
-      if (saved.length > 0) {
-        setConversations(saved);
-        setCurrentConvId(saved[0].id);
-      } else {
-        const initial = {
-          id: 'conv_' + Date.now(),
-          title: 'Nouvelle discussion',
-          createdAt: Date.now(),
-          messages: [],
-        };
-        setConversations([initial]);
-        setCurrentConvId(initial.id);
-      }
+      local = JSON.parse(localStorage.getItem(storageKey) || '[]') || [];
     } catch {
-      setConversations([]);
+      local = [];
     }
+    if (!local.length) {
+      local = [{ id: 'conv_' + Date.now(), title: 'Nouvelle discussion', createdAt: Date.now(), messages: [] }];
+    }
+    setConversations(local);
+    setCurrentConvId(local[0].id);
+
+    let cancelled = false;
+    fetchRemote()
+      .then((remote) => {
+        if (cancelled) return;
+        setConversations((current) => {
+          const { merged, synced } = mergeConversations(current, remote, syncedRef.current);
+          syncedRef.current = synced;
+          saveSynced(userId, synced);
+          setCurrentConvId((id) => (merged.some((c) => c.id === id) ? id : merged[0]?.id));
+          return merged.length ? merged : current;
+        });
+      })
+      .catch(() => {}) // offline or server issue: keep working from this device's copy
+      .finally(() => {
+        if (!cancelled) syncReadyRef.current = true;
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [userId]);
 
   // Preferences saved in the MySQL profile follow the user across devices.
@@ -306,6 +326,22 @@ export default function App() {
         showToast('⚠️ Stockage local plein : supprimez d’anciennes discussions.');
       }
     }
+    // Upload what changed to the account (debounced), once the sign-in merge is done.
+    if (!user || isGenerating) return undefined;
+    clearTimeout(pushTimerRef.current);
+    pushTimerRef.current = setTimeout(async () => {
+      if (!syncReadyRef.current || pushingRef.current) return;
+      pushingRef.current = true;
+      try {
+        syncedRef.current = await pushChanged(conversations, syncedRef.current);
+        saveSynced(userId, syncedRef.current);
+      } catch (_) {
+        /* offline: retried on the next change or the next sign-in */
+      } finally {
+        pushingRef.current = false;
+      }
+    }, 1200);
+    return () => clearTimeout(pushTimerRef.current);
   }, [conversations, user, isGenerating]);
 
   // Auto-scroll chat
@@ -447,6 +483,8 @@ export default function App() {
 
   const deleteConv = (id, e) => {
     e.stopPropagation();
+    deleteRemote(id);
+    delete syncedRef.current[id];
     const remaining = conversations.filter((c) => c.id !== id);
     if (remaining.length === 0) {
       const fresh = {
@@ -856,6 +894,10 @@ export default function App() {
             <button
               className="footer-mini-btn danger-hover"
               onClick={() => {
+                conversations.forEach((c) => {
+                  deleteRemote(c.id);
+                  delete syncedRef.current[c.id];
+                });
                 startNewChat();
                 setConversations((prev) => [prev[0]]);
               }}

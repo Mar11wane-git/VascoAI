@@ -85,5 +85,25 @@ react-app/src/
 
 Les comptes, sessions, profils, préférences et statistiques sont stockés dans MySQL (base `Vasco`).
 Configuration dans `.env` : `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`.
-Les tables sont créées automatiquement au démarrage (`users`, `sessions`, `user_profiles`, `user_stats`, `user_daily_usage`, `user_activity`).
+Les tables sont créées automatiquement au démarrage (`users`, `sessions`, `user_profiles`, `user_stats`, `user_daily_usage`, `user_activity`, `conversations`).
 L'ancien fichier `backend/users_db.json` est importé une seule fois puis renommé en `users_db.migrated.json`.
+
+Les discussions sont synchronisées avec le compte (table `conversations`, `/api/conversations`) : elles suivent
+l'utilisateur sur tous ses appareils. Le navigateur garde aussi une copie locale, qui sert hors ligne.
+
+## ✅ Tests et déploiement
+
+```powershell
+python -m pytest tests -q              # API, auth, discussions, outils, repli Pollinations (base MySQL "vasco_test")
+cd react-app; npm test                 # fusion des discussions entre appareils
+powershell -ExecutionPolicy Bypass -File deploy.ps1   # tests + build + Vercel, annulé si un test échoue
+```
+
+Les mêmes tests tournent sur GitHub Actions à chaque push (`.github/workflows/ci.yml`, avec un MySQL de test).
+
+## 🛟 Services gratuits et replis
+
+- **Vasco Cloud** utilise l'API Pollinations avec clé (`POLLINATIONS_API_KEY`). Si la clé ne marche plus (pollen
+  épuisé, clé révoquée, panne), il bascule seul sur l'API gratuite sans clé (historique raccourci, plus lent),
+  puis sur un moteur de secours.
+- **Images / vidéos** : même repli, clé puis API anonyme (une image toutes les ~45 s).

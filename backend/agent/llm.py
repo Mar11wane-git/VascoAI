@@ -369,6 +369,61 @@ class FreeCloudAdapter(OpenAICompatAdapter):
         )
         self.max_tool_rounds = 6 if key else 1
         self.keyed = bool(key)
+        self.fell_back = False
+
+    CLASSIC_ENDPOINT = "https://text.pollinations.ai/openai"
+    CLASSIC_MAX_CHARS = 15_000  # the keyless API rejects requests over 16k characters (messages + tools)
+
+    async def stream_turn(self, tools: Optional[List[ToolSpec]]) -> AsyncIterator[Dict[str, Any]]:
+        if not self.keyed:
+            async for ev in super().stream_turn(tools):
+                yield ev
+            return
+        emitted = False
+        try:
+            async for ev in super().stream_turn(tools):
+                emitted = True
+                yield ev
+            return
+        except (ProviderError, httpx.HTTPError) as e:
+            status = getattr(e, "status", 0)
+            if emitted or (isinstance(e, ProviderError) and status and status < 500 and status not in (401, 402, 403, 429)):
+                raise
+        # The key is out of pollen, revoked or the keyed API is down: keep answering through the free API.
+        self._use_classic()
+        yield {"type": "notice", "message": "Clé Pollinations indisponible : bascule sur le mode gratuit (plus lent)."}
+        async for ev in super().stream_turn(tools):
+            yield ev
+
+    def _use_classic(self) -> None:
+        self.keyed = False
+        self.fell_back = True
+        self.max_tool_rounds = 1
+        self.endpoint = self.CLASSIC_ENDPOINT
+        self.headers.pop("Authorization", None)
+        self.model = "openai"
+        self.compact_tools = True
+        self._trim_for_classic()
+
+    def _trim_for_classic(self) -> None:
+        """Keeps the system prompt (shortened if needed) and as many recent messages as fit the 16k cap."""
+        budget = self.CLASSIC_MAX_CHARS - 2500  # room for the compact tool definitions
+        system, rest = self.messages[0], self.messages[1:]
+        sys_text = system["content"][:6000]
+        budget -= len(sys_text)
+        kept: List[Dict[str, Any]] = []
+        for m in reversed(rest):
+            size = len(json.dumps(m, ensure_ascii=False))
+            if size > budget:
+                if not kept and isinstance(m.get("content"), str):  # the latest message alone is too long
+                    kept.append({**m, "content": m["content"][-max(budget - 200, 500):]})
+                break
+            kept.append(m)
+            budget -= size
+        kept.reverse()
+        while kept and kept[0]["role"] == "tool":  # a tool result needs its assistant call before it
+            kept.pop(0)
+        self.messages = [{"role": "system", "content": sys_text}] + kept
 
     def wait_hint(self, step: int) -> str:
         if self.keyed or step < 2:

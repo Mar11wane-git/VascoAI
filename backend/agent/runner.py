@@ -167,13 +167,17 @@ async def run_agent(*, provider: str, model: str, messages: List[Dict[str, Any]]
 
     if fast:
         adapter.use_fast_mode()
-    max_rounds = min(adapter.max_tool_rounds, MAX_STEPS - 1)
-    if max_tool_rounds is not None:  # e.g. voice mode: answer quickly
-        max_rounds = max(1, min(max_rounds, max_tool_rounds))
+    def rounds_allowed() -> int:
+        # Read on every step: an adapter may lower it mid-run (e.g. Vasco Cloud falling back to the free API).
+        n = min(adapter.max_tool_rounds, MAX_STEPS - 1)
+        if max_tool_rounds is not None:  # e.g. voice mode: answer quickly
+            n = max(1, min(n, max_tool_rounds))
+        return n
+
     try:
         while step < MAX_STEPS:
             step += 1
-            final_turn = step > max_rounds
+            final_turn = step > rounds_allowed()
             turn_tools = None if (final_turn and adapter.can_drop_tools) else offer_tools
             hint = adapter.wait_hint(step)
             if hint:
@@ -240,7 +244,7 @@ async def run_agent(*, provider: str, model: str, messages: List[Dict[str, Any]]
             # Keep results in the same order as the calls (required by some providers).
             order = {c.id: i for i, c in enumerate(result.tool_calls)}
             outputs.sort(key=lambda pair: order.get(pair[0].id, 0))
-            note = FINAL_STEP_NOTE if step + 1 > max_rounds else ""
+            note = FINAL_STEP_NOTE if step + 1 > rounds_allowed() else ""
             adapter.append_tool_results(result, outputs, note=note)
             if answer_parts and not answer_parts[-1].endswith("\n"):
                 answer_parts.append("\n\n")

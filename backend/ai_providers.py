@@ -487,18 +487,36 @@ async def _call_pollinations_fast(
     valid_model = model if model in ("openai", "openai-fast", "ovh-reasoning", "gpt-oss-20b") else "openai-fast"
     effort = "high" if (deep_think or valid_model == "ovh-reasoning") else "low"
     key = os.getenv("POLLINATIONS_API_KEY", "").strip() or None
-    reasoning, reply = await call_openai_compatible(
-        # Keyless "Classic" endpoint caps prompts at 16k characters; the keyed API doesn't.
-        endpoint_url=("https://gen.pollinations.ai/v1/chat/completions" if key
-                      else "https://text.pollinations.ai/openai"),
-        api_key=key,
-        model=valid_model,
-        messages=messages,
-        attachments=attachments,
-        system_prompt=system_prompt,
-        supports_vision=False,
-        extra_body={"reasoning_effort": effort},
-    )
+    common = dict(model=valid_model, attachments=attachments, supports_vision=False,
+                  extra_body={"reasoning_effort": effort})
+    reasoning, reply = None, ""
+    if key:
+        try:
+            reasoning, reply = await call_openai_compatible(
+                endpoint_url="https://gen.pollinations.ai/v1/chat/completions", api_key=key,
+                messages=messages, system_prompt=system_prompt, **common)
+        except Exception as e:  # out of pollen / revoked key / outage: use the keyless API below
+            print(f"[Vasco] Pollinations (clé) indisponible, bascule sans clé : {str(e)[:160]}")
+    if not reply:
+        # The keyless "Classic" API caps requests at 16k characters: keep the most recent messages that fit.
+        trimmed, budget = [], 13_000 - len(system_prompt[:6000])
+        for m in reversed(messages):
+            size = len(str(m.get("content", "")))
+            if size > budget:
+                break
+            trimmed.insert(0, m)
+            budget -= size
+        for attempt in range(2):
+            try:
+                reasoning, reply = await call_openai_compatible(
+                    endpoint_url="https://text.pollinations.ai/openai", api_key=None,
+                    messages=trimmed or messages[-1:], system_prompt=system_prompt[:6000], **common)
+                break
+            except RuntimeError as e:
+                wait = re.search(r"Retry after (\d+)s", str(e))
+                if attempt or not wait or int(wait.group(1)) > 50:
+                    raise
+                await asyncio.sleep(int(wait.group(1)) + 1)  # anonymous limit: one reply every 45 s per IP
     if not reply or not reply.strip():
         raise RuntimeError("Empty reply from Pollinations")
     show_reasoning = deep_think or (valid_model == "ovh-reasoning")

@@ -49,6 +49,7 @@ from backend.agent.runner import run_agent
 from backend.agent.tools import tools_catalog, code_execution_enabled
 from backend import db
 from backend import profile as profiles
+from backend import conversations
 
 
 @asynccontextmanager
@@ -549,6 +550,34 @@ def api_profile_activity(user: Dict[str, Any] = Depends(require_user)):
 def api_profile_delete(req: DeleteAccountRequest, user: Dict[str, Any] = Depends(require_user)):
     _profile_call(profiles.delete_account, user["id"], req.password, req.confirm)
     return {"status": "deleted"}
+
+
+# =====================================================================
+# CONVERSATIONS (synced across the user's devices)
+# =====================================================================
+
+class ConversationSaveRequest(BaseModel):
+    title: str = ""
+    messages: List[Any] = []
+    created_at: int = 0
+
+
+@app.get("/api/conversations")
+def api_conversations(user: Dict[str, Any] = Depends(require_user)):
+    return _profile_call(conversations.list_conversations, user["id"])
+
+
+@app.put("/api/conversations/{conv_id}")
+def api_conversation_save(conv_id: str, req: ConversationSaveRequest, user: Dict[str, Any] = Depends(require_user)):
+    updated = _profile_call(conversations.save_conversation, user["id"], conv_id, req.title, req.messages,
+                            req.created_at)
+    return {"status": "ok", "updatedAt": updated}
+
+
+@app.delete("/api/conversations/{conv_id}")
+def api_conversation_delete(conv_id: str, user: Dict[str, Any] = Depends(require_user)):
+    _profile_call(conversations.delete_conversation, user["id"], conv_id)
+    return {"status": "ok"}
 
 
 @app.post("/api/settings/keys")
