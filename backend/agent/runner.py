@@ -8,7 +8,7 @@ browser as Server-Sent Events:
     reasoning    {text}                      model thinking (delta)
     text         {text}                      answer text (delta)
     tool_start   {id, name, label, icon, args, step}
-    tool_end     {id, ok, summary, preview, duration_ms, sources, image_url}
+    tool_end     {id, ok, summary, preview, duration_ms, sources, image_url, video}
     notice       {message}
     done         {content, sources, steps, tool_calls, usage, elapsed_ms, provider_used, model_used}
     error        {message}
@@ -143,7 +143,7 @@ async def run_agent(*, provider: str, model: str, messages: List[Dict[str, Any]]
     tool_names = [t.name for t in tools]
 
     lang = detect_conversation_language(messages)
-    if provider == "ollama":  # local CPU/GPU models: keep the prompt short
+    if provider in ("ollama", "vasco_llm"):  # small self-hosted models: keep the prompt short
         system = build_compact_system_prompt(custom_system_prompt, bool(lang.get("is_darija")), image_mode)
     else:
         system = build_system_prompt(custom_system_prompt, tool_names, bool(lang.get("is_darija")), image_mode)
@@ -234,7 +234,7 @@ async def run_agent(*, provider: str, model: str, messages: List[Dict[str, Any]]
                 yield {
                     "type": "tool_end", "id": call.id, "ok": out.ok, "summary": out.summary,
                     "preview": out.preview[:2000], "duration_ms": ms, "sources": new_sources,
-                    "image_url": out.image_url,
+                    "image_url": out.image_url, "video": out.video,
                 }
 
             # Keep results in the same order as the calls (required by some providers).
@@ -249,7 +249,8 @@ async def run_agent(*, provider: str, model: str, messages: List[Dict[str, Any]]
         yield {"type": "error", "message": str(e)}
         return
     except httpx.ConnectError:
-        hint = " Vérifiez qu'Ollama est lancé (ollama serve) et l'URL dans « Clés API »." if provider == "ollama" else ""
+        hint = (" Vérifiez qu'Ollama est lancé (ollama serve) et l'URL dans « Clés API »."
+                if provider in ("ollama", "vasco_llm") else "")
         yield {"type": "error", "message": f"Impossible de joindre {adapter.provider_label}.{hint}"}
         return
     except httpx.TimeoutException:

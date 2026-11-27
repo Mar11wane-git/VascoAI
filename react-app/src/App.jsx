@@ -6,7 +6,7 @@ import {
   Paperclip, Plus, Search, Sparkles, Sun, Trash2, UploadCloud, UserRound, Wand2, X,
 } from 'lucide-react';
 import AuthPage from './components/AuthPage.jsx';
-import VoiceModeOverlay from './components/VoiceModeOverlay.jsx';
+import VoiceModeOverlay, { primeVoiceAudio } from './components/VoiceModeOverlay.jsx';
 import AgentMessage from './components/AgentMessage.jsx';
 import VascoLogo from './components/VascoLogo.jsx';
 const ProfilePage = lazy(() => import('./components/profile/ProfilePage.jsx'));
@@ -40,7 +40,7 @@ function applyAgentEvent(msg, ev) {
         parts: parts.map((p) =>
           p.type === 'tool' && p.id === ev.id
             ? { ...p, status: ev.ok ? 'ok' : 'error', summary: ev.summary, preview: ev.preview,
-                duration_ms: ev.duration_ms, image_url: ev.image_url }
+                duration_ms: ev.duration_ms, image_url: ev.image_url, video: ev.video }
             : p
         ),
         sources: [...(msg.sources || []), ...(ev.sources || [])],
@@ -70,7 +70,7 @@ function applyAgentEvent(msg, ev) {
 
 const textOfParts = (msg) =>
   (msg.parts || []).filter((p) => p.type === 'text').map((p) => p.text).join('\n\n').trim();
-
+  
 export default function App() {
   // Authentication State (Mandatory Gate)
   const [user, setUser] = useState(() => {
@@ -1351,7 +1351,10 @@ export default function App() {
                 <button
                   type="button"
                   className="dictate-icon-btn"
-                  onClick={() => setVoiceModeOpen(true)}
+                  onClick={() => {
+                    primeVoiceAudio(); // inside the tap: required by iOS Safari
+                    setVoiceModeOpen(true);
+                  }}
                   title="Parler avec Vasco"
                 >
                   <Mic size={19} />
@@ -1361,7 +1364,10 @@ export default function App() {
                 <button
                   type="button"
                   className="voice-wave-btn"
-                  onClick={() => setVoiceModeOpen(true)}
+                  onClick={() => {
+                    primeVoiceAudio(); // inside the tap: required by iOS Safari
+                    setVoiceModeOpen(true);
+                  }}
                   title="Conversation vocale en direct avec Vasco"
                 >
                   <AudioLines size={20} color="white" />

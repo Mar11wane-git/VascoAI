@@ -13,3 +13,11 @@ backend/users_db*.json
 
 # Database exports (contain user data)
 *.sql
+.vercel
+.env*
+!.env.example
+
+# Vasco LLM: generated training data, Kaggle staging and model weights
+vasco-llm/build/
+*.gguf
+*.safetensors

@@ -38,8 +38,8 @@ def can_manage_server_keys(user: Dict[str, Any]) -> bool:
         return (user.get("email") or "").lower() in admins
     return IS_LOCAL
 
-# In-memory store for completed OAuth state sessions (survives COOP popup opener severing)
-COMPLETED_OAUTH_STATES: Dict[str, Dict[str, Any]] = {}
+# Completed OAuth sign-ins, polled by the login page (survives COOP popup opener severing)
+COMPLETED_OAUTH_STATES = db.OAuthStateStore()
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -97,17 +97,16 @@ def get_user_row(user_id: str) -> Optional[Dict[str, Any]]:
 def _insert_user(user_id: str, email: str, name: str, provider: str, avatar: str,
                  username: str = "", provider_uid: str = "", salt: str = "", pwd_hash: str = "") -> None:
     first, _, last = name.partition(" ")
-    with db.connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """INSERT INTO users (id, email, name, username, provider, provider_uid, avatar, salt, password_hash)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (user_id, email, name[:120], username[:80], provider, provider_uid[:64], avatar, salt, pwd_hash),
-        )
-        cur.execute(
-            "INSERT IGNORE INTO user_profiles (user_id, first_name, last_name) VALUES (%s,%s,%s)",
-            (user_id, first[:80], last.strip()[:80]),
-        )
-        cur.execute("INSERT IGNORE INTO user_stats (user_id) VALUES (%s)", (user_id,))
+    db.execute(
+        """INSERT INTO users (id, email, name, username, provider, provider_uid, avatar, salt, password_hash)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (user_id, email, name[:120], username[:80], provider, provider_uid[:64], avatar, salt, pwd_hash),
+    )
+    db.execute(
+        "INSERT IGNORE INTO user_profiles (user_id, first_name, last_name) VALUES (%s,%s,%s)",
+        (user_id, first[:80], last.strip()[:80]),
+    )
+    db.execute("INSERT IGNORE INTO user_stats (user_id) VALUES (%s)", (user_id,))
 
 
 def create_session(user: Dict[str, Any], login_method: str = "", user_agent: str = "", ip: str = "") -> Dict[str, Any]:
@@ -168,15 +167,13 @@ def oauth_upsert_user(
 
     if existing:
         # A photo the user uploaded themselves (data URL) is kept over the provider's picture.
-        keep_avatar = (existing.get("avatar") or "").startswith("data:")
+        old_avatar = existing.get("avatar") or ""
+        keep_avatar = old_avatar.startswith("data:") or not avatar
         db.execute(
-            """UPDATE users SET provider=%s,
-                   avatar=IF(%s OR %s='', avatar, %s),
-                   username=IF(%s='', username, %s),
-                   provider_uid=IF(%s='', provider_uid, %s)
-               WHERE id=%s""",
-            (provider, keep_avatar, avatar, avatar, username, username[:80],
-             provider_uid, provider_uid[:64], existing["id"]),
+            "UPDATE users SET provider=%s, avatar=%s, username=%s, provider_uid=%s WHERE id=%s",
+            (provider, old_avatar if keep_avatar else avatar,
+             username[:80] or existing.get("username") or "",
+             provider_uid[:64] or existing.get("provider_uid") or "", existing["id"]),
         )
         return create_session(existing, provider)
 
@@ -215,11 +212,26 @@ def logout_token(token: str) -> None:
 # REAL GOOGLE OAUTH 2.0 (https://accounts.google.com/o/oauth2/v2/auth)
 # =====================================================================
 
+GOOGLE_NOT_CONFIGURED = (
+    "La connexion Google n'est pas encore configurée sur ce serveur : "
+    "ajoutez GOOGLE_CLIENT_ID et GOOGLE_CLIENT_SECRET (votre propre client OAuth Google)."
+)
+GITHUB_NOT_CONFIGURED = (
+    "La connexion GitHub n'est pas encore configurée sur ce serveur : "
+    "ajoutez GITHUB_CLIENT_ID et GITHUB_CLIENT_SECRET (votre propre OAuth App GitHub)."
+)
+
+
 def get_google_oauth_credentials() -> tuple[str, str]:
+    """The app's own Google OAuth client. The built-in loopback client only works on localhost."""
     load_dotenv(ENV_PATH, override=True)
-    cid = os.getenv("GOOGLE_CLIENT_ID", "").strip() or DEFAULT_GOOGLE_CLIENT_ID
-    csec = os.getenv("GOOGLE_CLIENT_SECRET", "").strip() or DEFAULT_GOOGLE_CLIENT_SECRET
-    return cid, csec
+    cid = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    csec = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+    if cid and csec:
+        return cid, csec
+    if IS_LOCAL:
+        return DEFAULT_GOOGLE_CLIENT_ID, DEFAULT_GOOGLE_CLIENT_SECRET
+    raise ValueError(GOOGLE_NOT_CONFIGURED)
 
 
 def build_google_authorize_url(state: str) -> str:
@@ -405,7 +417,11 @@ async def exchange_github_code_for_session(code: str, state: str = "") -> Dict[s
 async def start_github_device_flow() -> Dict[str, Any]:
     """Starts an official GitHub OAuth 2.0 Device Flow against https://github.com/login/device."""
     load_dotenv(ENV_PATH, override=True)
-    cid = os.getenv("GITHUB_CLIENT_ID", "").strip() or DEFAULT_GITHUB_DEVICE_CLIENT_ID
+    cid = os.getenv("GITHUB_CLIENT_ID", "").strip()
+    if not cid:
+        if not IS_LOCAL:
+            raise ValueError(GITHUB_NOT_CONFIGURED)
+        cid = DEFAULT_GITHUB_DEVICE_CLIENT_ID
     async with httpx.AsyncClient(timeout=12.0) as client:
         resp = await client.post(
             "https://github.com/login/device/code",

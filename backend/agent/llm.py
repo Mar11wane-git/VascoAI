@@ -197,7 +197,7 @@ class OpenAICompatAdapter(BaseAdapter):
             params = {
                 "type": "object",
                 "properties": {
-                    k: {key: v[key] for key in ("type", "enum") if key in v}
+                    k: {key: v[key] for key in ("type", "enum", "items") if key in v}
                     for k, v in t.parameters.get("properties", {}).items()
                 },
                 "required": t.parameters.get("required", []),
@@ -357,8 +357,12 @@ class FreeCloudAdapter(OpenAICompatAdapter):
                 "calculator call per number you will report), then you will write the final answer "
                 "from the results without further tools."
             )
+        # The keyless "Classic" endpoint caps prompts at 16k characters (system prompt + tools + history),
+        # so with a key use the keyed API, which has no such cap.
+        endpoint = ("https://gen.pollinations.ai/v1/chat/completions" if key
+                    else "https://text.pollinations.ai/openai")
         super().__init__(
-            endpoint="https://text.pollinations.ai/openai", api_key=key, model="openai",
+            endpoint=endpoint, api_key=key, model=os.getenv("POLLINATIONS_TEXT_MODEL", "openai"),
             provider_label="Vasco Cloud", vision=False,
             extra_body={"reasoning_effort": "high" if deep_think else "low"},
             system=system, history=history, attachments=attachments,
@@ -749,6 +753,20 @@ def build_adapter(*, provider: str, model: str, system: str, history: List[Dict[
             provider_label="OpenRouter", vision=vision,
             extra_headers={"HTTP-Referer": "http://localhost:8000", "X-Title": "Vasco AI Agent"}, **common,
         )
+    if provider == "vasco_llm":
+        # Vasco's own model (open-source base fine-tuned on Darija, see vasco-llm/). Served by any
+        # OpenAI-compatible server: VASCO_LLM_URL (e.g. https://host/v1), else the local Ollama.
+        url = os.getenv("VASCO_LLM_URL", "").strip().rstrip("/")
+        if not url:
+            url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/") + "/v1"
+        name = os.getenv("VASCO_LLM_MODEL", "").strip() if model == "vasco" else model
+        adapter = OpenAICompatAdapter(
+            endpoint=f"{url}/chat/completions", api_key=os.getenv("VASCO_LLM_KEY", "").strip() or "ollama",
+            model=name or model, provider_label="Vasco LLM", vision=False, timeout=600.0, compact_tools=True,
+            **common,
+        )
+        adapter.max_tool_rounds = 3
+        return adapter
     if provider == "ollama":
         base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
         adapter = OpenAICompatAdapter(

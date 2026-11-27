@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
 from bs4 import BeautifulSoup
 
+from backend.images import image_url
 from backend.web_search import fetch_google_news_rss, fetch_wikipedia_fast
 
 # An honest bot User-Agent with a contact URL, as Wikimedia's robot policy requires
@@ -57,6 +58,7 @@ class ToolOutput:
     preview: str = ""                 # short excerpt for the UI's expandable panel
     sources: List[Dict[str, Any]] = field(default_factory=list)
     image_url: Optional[str] = None
+    video: Optional[Dict[str, Any]] = None  # reel spec rendered by the browser (create_video)
 
 
 @dataclass
@@ -457,10 +459,7 @@ async def tool_generate_image(args: Dict[str, Any]) -> ToolOutput:
     width = max(256, min(int(args.get("width", 1024)), 1536))
     height = max(256, min(int(args.get("height", 1024)), 1536))
     seed = random.randint(1, 10_000_000)
-    url = (
-        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}"
-        f"?width={width}&height={height}&seed={seed}&nologo=true&enhance=true"
-    )
+    url = image_url(prompt, width, height, seed)
     return ToolOutput(
         content=(
             f"Image generated ({width}x{height}). Show it to the user by including exactly this markdown "
@@ -469,6 +468,67 @@ async def tool_generate_image(args: Dict[str, Any]) -> ToolOutput:
         summary=f"{width}×{height}",
         preview=prompt,
         image_url=url,
+    )
+
+
+# =====================================================================
+# create_video : AI reel (images + voice-over + captions), assembled in the browser
+# =====================================================================
+
+VIDEO_SIZES = {"9:16": (720, 1280), "16:9": (1280, 720), "1:1": (1024, 1024)}
+MAX_VIDEO_SCENES = 8
+
+
+async def tool_create_video(args: Dict[str, Any]) -> ToolOutput:
+    raw = args.get("scenes")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = None
+    if not isinstance(raw, list):
+        return ToolOutput(content="Invalid 'scenes': give a list of {narration, image_prompt} objects.",
+                          ok=False, summary="Scènes invalides")
+    scenes = []
+    for s in raw[:MAX_VIDEO_SCENES]:
+        if not isinstance(s, dict):
+            continue
+        narration = str(s.get("narration") or "").strip()[:400]
+        image_prompt = str(s.get("image_prompt") or "").strip()[:500]
+        if narration and image_prompt:
+            scenes.append((narration, image_prompt))
+    if len(scenes) < 2:
+        return ToolOutput(content="A video needs at least 2 scenes, each with 'narration' and 'image_prompt'.",
+                          ok=False, summary="Pas assez de scènes")
+
+    aspect = args.get("aspect") if args.get("aspect") in VIDEO_SIZES else "9:16"
+    width, height = VIDEO_SIZES[aspect]
+    character = str(args.get("character") or "").strip()[:300]
+    style = str(args.get("style") or "").strip()[:200] or "vibrant 3D animated movie style, cinematic lighting"
+    seed = random.randint(1, 10_000_000)  # one seed for the whole video keeps the look consistent
+    title = str(args.get("title") or "").strip()[:80]
+    video = {
+        "title": title,
+        "aspect": aspect,
+        "width": width,
+        "height": height,
+        "voice": args.get("voice") if args.get("voice") in ("male", "female") else "male",
+        "scenes": [
+            {"narration": n, "image": image_url(", ".join(x for x in (p, character, style, "highly detailed") if x),
+                                                width, height, seed + i)}
+            for i, (n, p) in enumerate(scenes)
+        ],
+    }
+    return ToolOutput(
+        content=(
+            f"The video \"{title or 'sans titre'}\" ({len(scenes)} scenes, {aspect}) is now shown to the user in a "
+            "video player with voice-over and captions, with buttons to play it and to download it as a video file. "
+            "Do NOT add image markdown or links. Reply in one or two short sentences in the user's language: say it "
+            "is ready, that they can press play and download it (to post on Instagram/TikTok), and offer to change it."
+        ),
+        summary=f"{len(scenes)} scènes · {aspect}",
+        preview="\n".join(f"{i + 1}. {n}" for i, (n, _) in enumerate(scenes)),
+        video=video,
     )
 
 
@@ -626,6 +686,43 @@ TOOLS: Dict[str, ToolSpec] = {
         },
         handler=tool_generate_image,
     ),
+    "create_video": ToolSpec(
+        name="create_video",
+        label="Création de vidéo",
+        icon="🎬",
+        description=(
+            "Create a short video (an AI reel for Instagram/TikTok/YouTube Shorts): AI images for each scene, "
+            "a voice-over reading the narration, animated captions and motion. Use it whenever the user asks for a "
+            "video, reel, short, clip or animated story. Write a fun, punchy script: 3-6 scenes, each narration one or "
+            "two short sentences in the user's language (Moroccan Darija in Arabic script if they write Darija). "
+            "Describe the recurring character once in 'character' (English, precise looks/clothes) so it stays "
+            "the same in every scene; each image_prompt (English) describes only that scene's action and setting."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Short title shown at the start."},
+                "scenes": {
+                    "type": "array",
+                    "description": "2-8 scenes in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "narration": {"type": "string", "description": "Voice-over text for this scene, in the user's language."},
+                            "image_prompt": {"type": "string", "description": "English description of this scene's image."},
+                        },
+                        "required": ["narration", "image_prompt"],
+                    },
+                },
+                "character": {"type": "string", "description": "English description of the main character(s), repeated in every image."},
+                "style": {"type": "string", "description": "English visual style, e.g. '3D Pixar cartoon, vibrant colors'."},
+                "aspect": {"type": "string", "enum": ["9:16", "16:9", "1:1"], "description": "9:16 (default) for Instagram/TikTok, 16:9 for YouTube."},
+                "voice": {"type": "string", "enum": ["male", "female"], "description": "Narrator voice."},
+            },
+            "required": ["scenes"],
+        },
+        handler=tool_create_video,
+    ),
     "run_python": ToolSpec(
         name="run_python",
         label="Exécution Python",
@@ -650,7 +747,7 @@ def available_tools(web: bool = True, images: bool = True) -> List[ToolSpec]:
     if web:
         names += ["web_search", "fetch_url"]
     if images:
-        names.append("generate_image")
+        names += ["generate_image", "create_video"]
     if code_execution_enabled():
         names.append("run_python")
     return [TOOLS[n] for n in names]

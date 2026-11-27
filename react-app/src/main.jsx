@@ -7,6 +7,7 @@ import './theme.css';
 import './modern.css';
 import './profile.css';
 import './design.css';
+import './voice.css';
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>

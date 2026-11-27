@@ -61,6 +61,17 @@ PROVIDERS_CATALOG = [
         ],
     },
     {
+        # Vasco's own model (vasco-llm/). Only listed when it is actually served: VASCO_LLM_URL is set,
+        # or a "vasco" model is installed in the local Ollama.
+        "id": "vasco_llm",
+        "name": "🇲🇦 Vasco LLM (modèle maison)",
+        "requires_key": False,
+        "env_key": "VASCO_LLM_URL",
+        "models": [
+            _m("vasco", "Vasco LLM", "Modèle maison • Darija • Expérimental"),
+        ],
+    },
+    {
         "id": "openai",
         "name": "🟢 ChatGPT (OpenAI)",
         "requires_key": True,
@@ -475,9 +486,12 @@ async def _call_pollinations_fast(
     """
     valid_model = model if model in ("openai", "openai-fast", "ovh-reasoning", "gpt-oss-20b") else "openai-fast"
     effort = "high" if (deep_think or valid_model == "ovh-reasoning") else "low"
+    key = os.getenv("POLLINATIONS_API_KEY", "").strip() or None
     reasoning, reply = await call_openai_compatible(
-        endpoint_url="https://text.pollinations.ai/openai",
-        api_key=None,
+        # Keyless "Classic" endpoint caps prompts at 16k characters; the keyed API doesn't.
+        endpoint_url=("https://gen.pollinations.ai/v1/chat/completions" if key
+                      else "https://text.pollinations.ai/openai"),
+        api_key=key,
         model=valid_model,
         messages=messages,
         attachments=attachments,
@@ -704,6 +718,22 @@ async def generate_vasco_response(
             supports_vision=supports_vision,
         )
         return {"reply": reply, "reasoning": reasoning, "provider_used": "Ollama Local", "model_used": model}
+
+    elif provider == "vasco_llm":
+        url = os.getenv("VASCO_LLM_URL", "").strip().rstrip("/")
+        if not url:
+            url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/") + "/v1"
+        name = (os.getenv("VASCO_LLM_MODEL", "").strip() if model == "vasco" else model) or model
+        reasoning, reply = await call_openai_compatible(
+            endpoint_url=f"{url}/chat/completions",
+            api_key=os.getenv("VASCO_LLM_KEY", "").strip() or "ollama",
+            model=name,
+            messages=enriched_messages,
+            attachments=attachments,
+            system_prompt=sys_prompt,
+            supports_vision=False,
+        )
+        return {"reply": reply, "reasoning": reasoning, "provider_used": "Vasco LLM", "model_used": name}
 
     else:
         raise ValueError(f"Fournisseur IA inconnu : {provider}")

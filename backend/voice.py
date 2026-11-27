@@ -137,4 +137,14 @@ async def voice_reply(*, provider: str, model: str, messages: List[Dict[str, Any
             sources = ev.get("sources") or []
         elif ev.get("type") == "error":
             error = ev.get("message") or "Erreur inconnue"
+    if error and not reply and provider != "vasco_free":
+        # The chosen provider failed (no credit, bad key…): a spoken conversation must still get an answer.
+        # Gemini (when configured) is the steadier backup; the free cloud model is the last resort.
+        if provider != "gemini" and os.getenv("GEMINI_API_KEY", "").strip():
+            backup = ("gemini", "gemini-3.5-flash")
+        else:
+            backup = ("vasco_free", "openai")
+        print(f"[Vasco] voice_reply: {provider} failed ({error[:120]}), falling back to {backup[0]}")
+        return await voice_reply(provider=backup[0], model=backup[1], messages=messages,
+                                 custom_system_prompt=custom_system_prompt, web_search=web_search, darija=darija)
     return {"reply": _strip_for_speech(reply), "display": reply, "sources": sources, "error": error}

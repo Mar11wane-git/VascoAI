@@ -1,4 +1,4 @@
-import { BookOpen, Calculator, Clock, Code2, ImagePlus, Search, Wrench } from 'lucide-react';
+import { BookOpen, Calculator, Clapperboard, Clock, Code2, ImagePlus, Search, Wrench } from 'lucide-react';
 
 const TOOL_ICONS = {
   web_search: Search,
@@ -6,6 +6,7 @@ const TOOL_ICONS = {
   calculator: Calculator,
   get_datetime: Clock,
   generate_image: ImagePlus,
+  create_video: Clapperboard,
   run_python: Code2,
 };
 

@@ -435,6 +435,8 @@ h1, h2, h3, .brand-name, .welcome-screen h1, .auth-brand h2 {
 .voice-mic-select option { background: #0c1016; color: #e8edf4; }
 .voice-mic-select.attention { border-color: #f59e0b; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25); }
 @media (max-width: 768px) { .voice-mic-select { max-width: 110px; } }
+/* Phones: one built-in mic, the picker only shows up when no sound arrives. */
+@media (max-width: 600px) { .voice-mic-select:not(.attention) { display: none; } }
 .live-voice-tool {
   color: #99f6e4;
   background: rgba(20, 184, 166, 0.1);

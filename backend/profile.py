@@ -143,7 +143,7 @@ def update_profile(user_id: str, data: Dict[str, Any], ip: str = "") -> Dict[str
 
     if sets:
         cols = ", ".join(f"`{k}`=%s" for k in sets)
-        db.execute(f"UPDATE user_profiles SET {cols} WHERE user_id=%s", (*sets.values(), user_id))
+        db.execute(f"UPDATE user_profiles SET {cols}, updated_at=NOW() WHERE user_id=%s", (*sets.values(), user_id))
 
     # Display name / username live on the users table.
     user_sets: Dict[str, Any] = {}
@@ -273,21 +273,21 @@ def record_usage(user_id: str, messages: int = 0, tool_calls: int = 0, voice_tur
                  files: int = 0, images: int = 0) -> None:
     """Increments usage counters; never raises (stats must not break a chat)."""
     try:
+        # Insert-if-missing then increment: works the same on MySQL and PostgreSQL.
+        db.execute("INSERT IGNORE INTO user_stats (user_id) VALUES (%s)", (user_id,))
         db.execute(
-            """INSERT INTO user_stats (user_id, messages_sent, tool_calls, voice_turns, files_uploaded,
-                                       images_generated, last_active_at)
-               VALUES (%s,%s,%s,%s,%s,%s,NOW())
-               ON DUPLICATE KEY UPDATE messages_sent=messages_sent+VALUES(messages_sent),
-                   tool_calls=tool_calls+VALUES(tool_calls), voice_turns=voice_turns+VALUES(voice_turns),
-                   files_uploaded=files_uploaded+VALUES(files_uploaded),
-                   images_generated=images_generated+VALUES(images_generated), last_active_at=NOW()""",
-            (user_id, messages, tool_calls, voice_turns, files, images),
+            """UPDATE user_stats SET messages_sent=messages_sent+%s, tool_calls=tool_calls+%s,
+                   voice_turns=voice_turns+%s, files_uploaded=files_uploaded+%s,
+                   images_generated=images_generated+%s, last_active_at=NOW()
+               WHERE user_id=%s""",
+            (messages, tool_calls, voice_turns, files, images, user_id),
         )
         if messages or voice_turns:
+            today = date.today()
+            db.execute("INSERT IGNORE INTO user_daily_usage (user_id, day) VALUES (%s, %s)", (user_id, today))
             db.execute(
-                """INSERT INTO user_daily_usage (user_id, day, messages) VALUES (%s, CURDATE(), %s)
-                   ON DUPLICATE KEY UPDATE messages=messages+VALUES(messages)""",
-                (user_id, messages + voice_turns),
+                "UPDATE user_daily_usage SET messages=messages+%s WHERE user_id=%s AND day=%s",
+                (messages + voice_turns, user_id, today),
             )
     except db.DatabaseError:
         pass

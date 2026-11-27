@@ -1,6 +1,8 @@
 import base64
+import contextlib
 import json
 import os
+from html import escape as html_escape
 
 import httpx
 from contextlib import asynccontextmanager
@@ -9,7 +11,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Hea
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response, RedirectResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, RedirectResponse, HTMLResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from backend.file_processor import process_uploaded_file
@@ -20,7 +22,8 @@ from backend.web_search import (
 )
 from backend.darija import synthesize_speech_mp3, detect_conversation_language
 from backend.voice import VoiceError, server_stt_available, transcribe_audio, voice_reply
-from backend.live import handle_live, live_available
+from backend.live import handle_live, live_available, create_live_token, run_live_tool
+from backend.images import ImageError, fetch_image, verify as verify_image
 from backend.auth import (
     register_email_user,
     login_email_user,
@@ -50,9 +53,12 @@ from backend import profile as profiles
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await run_in_threadpool(db.init_db)
-    cfg = db._config()
-    print(f"[Vasco] Base MySQL prête : {cfg['user']}@{cfg['host']}:{cfg['port']}/{cfg['database']}")
+    try:
+        await run_in_threadpool(db.init_db)
+        print(f"[Vasco] Base de données prête : {db.describe()}")
+    except db.DatabaseError as e:
+        # Serve anyway: the schema is created on the first query once the database is reachable.
+        print(f"[Vasco] ⚠️ Base de données indisponible au démarrage : {e}")
     yield
 
 
@@ -72,6 +78,14 @@ app.add_middleware(
 )
 
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
+
+DB_UNAVAILABLE = "Base de données indisponible pour le moment. Réessayez dans un instant."
+
+
+@app.exception_handler(db.DatabaseError)
+async def database_error_handler(_request: Request, exc: db.DatabaseError):
+    print(f"[Vasco] Erreur base de données : {exc}")  # details stay in the server logs
+    return JSONResponse(status_code=503, content={"detail": DB_UNAVAILABLE})
 
 
 def bearer_token(authorization: Optional[str] = Header(default=None)) -> str:
@@ -171,24 +185,25 @@ class ApiKeysUpdateRequest(BaseModel):
 def _render_oauth_popup_html(session: Optional[Dict[str, Any]] = None, error: str = "") -> HTMLResponse:
     """Renders an HTML page inside the OAuth popup that notifies the parent React window and closes itself."""
     if error:
-        payload_json = json.dumps({"type": "VASCO_OAUTH_ERROR", "error": error})
+        payload = {"type": "VASCO_OAUTH_ERROR", "error": error}
         title = "Erreur d'authentification"
         subtitle = error
         color = "#ef4444"
     else:
-        payload_json = json.dumps({
-            "type": "VASCO_OAUTH_SUCCESS",
-            "token": session["token"],
-            "user": session["user"],
-        })
+        payload = {"type": "VASCO_OAUTH_SUCCESS", "token": session["token"], "user": session["user"]}
         title = f"Connecté en tant que {session['user']['name']}"
         subtitle = f"Compte vérifié ({session['user']['email']}). Redirection vers Vasco..."
         color = "#10b981"
+    # `error` can come from the query string: escape everything placed in the page.
+    title, subtitle = html_escape(title), html_escape(subtitle)
+    payload_json = json.dumps(payload).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    back_link = '<p style="margin-top:18px"><a href="/" style="color:#a78bfa">Retour à Vasco</a></p>' if error else ""
 
     html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
   <title>Vasco OAuth 2.0</title>
   <style>
     body {{
@@ -214,6 +229,7 @@ def _render_oauth_popup_html(session: Optional[Dict[str, Any]] = None, error: st
     <div class="dot">{'✕' if error else '✓'}</div>
     <h2>{title}</h2>
     <p>{subtitle}</p>
+    {back_link}
   </div>
   <script>
     (function() {{
@@ -230,7 +246,9 @@ def _render_oauth_popup_html(session: Optional[Dict[str, Any]] = None, error: st
         }}
       }} catch (e) {{}}
       setTimeout(function() {{
-        window.close();
+        // Google's pages cut the link to the opener: then this tab can't close itself,
+        // so it continues to Vasco instead (an error stays visible with a link back).
+        if (window.opener) window.close();
         if (!window.closed && data.type === "VASCO_OAUTH_SUCCESS") {{
           window.location.href = "/?oauth_token=" + encodeURIComponent(data.token);
         }}
@@ -279,6 +297,16 @@ async def list_models():
             p["running"] = installed is not None
             if installed:
                 p["models"] = installed
+        elif p["id"] == "vasco_llm":
+            # Every installed version (vasco, vasco:v1, ...) when served locally by Ollama.
+            local = [
+                {**m, "name": f"Vasco LLM — {m['id']}", "badge": "Modèle maison • Darija • " + m["badge"]}
+                for m in (installed or []) if m["id"].split(":")[0] == "vasco"
+            ]
+            p["running"] = bool(os.getenv("VASCO_LLM_URL", "").strip()) or bool(local)
+            if local and not os.getenv("VASCO_LLM_URL", "").strip():
+                p["models"] = local
+    providers = [p for p in providers if p["id"] != "vasco_llm" or p.get("running")]
     return {
         "providers": providers,
         "keys_status": get_api_keys_status(),
@@ -308,7 +336,13 @@ def api_login(req: AuthLoginRequest, request: Request):
 @app.get("/api/auth/google/login")
 async def api_google_login(state: str = ""):
     """Redirects user to official Google OAuth 2.0 account chooser (accounts.google.com)."""
-    url = build_google_authorize_url(state=state)
+    try:
+        url = build_google_authorize_url(state=state)
+    except ValueError as ve:
+        if state:
+            with contextlib.suppress(db.DatabaseError):
+                COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": str(ve)}
+        return _render_oauth_popup_html(error=str(ve))
     return RedirectResponse(url=url)
 
 
@@ -318,15 +352,18 @@ async def api_google_callback(code: Optional[str] = None, state: str = "", error
     if error or not code:
         err_msg = error or "Connexion Google annulée."
         if state:
-            COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": err_msg}
+            with contextlib.suppress(db.DatabaseError):
+                COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": err_msg}
         return _render_oauth_popup_html(error=err_msg)
     try:
         session = await exchange_google_code_for_session(code=code, state=state)
         return _render_oauth_popup_html(session=session)
     except Exception as e:
+        msg = DB_UNAVAILABLE if isinstance(e, db.DatabaseError) else str(e)
         if state:
-            COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": str(e)}
-        return _render_oauth_popup_html(error=str(e))
+            with contextlib.suppress(db.DatabaseError):
+                COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": msg}
+        return _render_oauth_popup_html(error=msg)
 
 
 # =====================================================================
@@ -347,15 +384,18 @@ async def api_github_callback(code: Optional[str] = None, state: str = "", error
     if error or not code:
         err_msg = error or "Connexion GitHub annulée."
         if state:
-            COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": err_msg}
+            with contextlib.suppress(db.DatabaseError):
+                COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": err_msg}
         return _render_oauth_popup_html(error=err_msg)
     try:
         session = await exchange_github_code_for_session(code=code, state=state)
         return _render_oauth_popup_html(session=session)
     except Exception as e:
+        msg = DB_UNAVAILABLE if isinstance(e, db.DatabaseError) else str(e)
         if state:
-            COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": str(e)}
-        return _render_oauth_popup_html(error=str(e))
+            with contextlib.suppress(db.DatabaseError):
+                COMPLETED_OAUTH_STATES[state] = {"status": "error", "error": msg}
+        return _render_oauth_popup_html(error=msg)
 
 
 @app.post("/api/auth/github/device/start")
@@ -383,11 +423,10 @@ async def api_github_device_poll(req: GitHubDevicePollRequest):
 
 
 @app.get("/api/auth/oauth/status")
-async def api_oauth_state_status(state: str):
+def api_oauth_state_status(state: str):
     """Polled by the React frontend to detect when the Google or GitHub OAuth popup finishes."""
-    if not state or state not in COMPLETED_OAUTH_STATES:
-        return {"status": "pending"}
-    return COMPLETED_OAUTH_STATES[state]
+    found = COMPLETED_OAUTH_STATES.get(state) if state else None
+    return found or {"status": "pending"}
 
 
 @app.post("/api/auth/me")
@@ -457,8 +496,6 @@ def _profile_call(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
-    except db.DatabaseError as de:
-        raise HTTPException(status_code=503, detail=str(de))
 
 
 @app.get("/api/profile")
@@ -523,6 +560,11 @@ async def update_keys(payload: ApiKeysUpdateRequest, user: Dict[str, Any] = Depe
             detail="Seul l'administrateur du serveur peut modifier les clés API (variable ADMIN_EMAILS).",
         )
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if os.getenv("VERCEL"):
+        raise HTTPException(
+            status_code=400,
+            detail="Sur Vercel, ajoutez les clés dans Settings → Environment Variables puis redéployez.",
+        )
     new_status = save_api_keys(updates)
     return {
         "status": "ok",
@@ -566,6 +608,22 @@ async def tts_endpoint(req: TTSRequest, user: Dict[str, Any] = Depends(require_u
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/image")
+async def image_proxy(p: str, w: int = 1024, h: int = 1024, s: int = 0, sig: str = ""):
+    """AI image for generate_image / create_video. URLs are signed by the server (see backend/images.py)."""
+    if not verify_image(p, w, h, s, sig):
+        raise HTTPException(status_code=403, detail="Lien d'image invalide.")
+    try:
+        data, ctype = await fetch_image(p, max(256, min(w, 1536)), max(256, min(h, 1536)), s)
+    except ImageError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Service d'images injoignable : {e}")
+    # Same signed parameters always give the same image: let browsers and the CDN keep it.
+    return Response(content=data, media_type=ctype,
+                    headers={"Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable"})
+
+
 # ----------------------------- Voice mode -----------------------------
 MAX_VOICE_AUDIO_BYTES = 12 * 1024 * 1024
 
@@ -586,6 +644,37 @@ async def voice_live(websocket: WebSocket, token: str = ""):
         await websocket.close(code=4401)
         return
     await handle_live(websocket, user)
+
+
+class LiveTokenRequest(BaseModel):
+    voice: str = "male"
+    web_search: bool = True
+    system_prompt: str = ""
+    history: List[Dict[str, Any]] = []
+    resume: str = ""
+
+
+class LiveToolRequest(BaseModel):
+    name: str
+    args: Dict[str, Any] = {}
+    web_search: bool = True
+
+
+@app.post("/api/voice/live-token")
+async def voice_live_token(req: LiveTokenRequest, user: Dict[str, Any] = Depends(require_user)):
+    """Single-use token so the browser streams voice straight from Gemini Live (setup locked here)."""
+    history = [{"role": str(m.get("role", "")), "content": str(m.get("content", ""))[:2000]} for m in req.history[-10:]]
+    try:
+        return await create_live_token(voice=req.voice, custom=req.system_prompt[:4000], history=history,
+                                       web=req.web_search, resume=req.resume[:2000] or None)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/api/voice/tool")
+async def voice_tool(req: LiveToolRequest, user: Dict[str, Any] = Depends(require_user)):
+    """Runs a tool Gemini Live asked for during a direct voice session (web search, calculator...)."""
+    return {"result": await run_live_tool(req.name, req.args, req.web_search)}
 
 
 @app.post("/api/voice/transcribe")
@@ -747,9 +836,19 @@ if os.path.isdir(FRONTEND_DIR):
     app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse(os.path.join(FRONTEND_DIR, "favicon.svg"), media_type="image/svg+xml")
+
+
 @app.get("/")
 async def serve_index():
     index_path = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index_path):
-        return FileResponse(index_path)
+        # No ETag/Last-Modified: on Vercel every file has the same mtime and a rebuilt index.html often
+        # has the same size, so FileResponse's ETag never changes and browsers keep a stale page (304)
+        # that points to deleted /static/assets/index-*.js bundles.
+        with open(index_path, encoding="utf-8") as f:
+            html = f.read()
+        return HTMLResponse(html, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
     return {"message": "Vasco AI Backend is running."}

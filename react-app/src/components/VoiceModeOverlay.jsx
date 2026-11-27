@@ -22,6 +22,241 @@ const NOISE_WINDOW = 70; // ~3 s of frames used to estimate the room's backgroun
 const CALIBRATION_MS = 500; // noise is measured before speech can trigger
 const PRE_ROLL_MS = 350; // audio kept from just before speech was detected
 const HISTORY_TURNS = 12;
+// 10 ms of silence, played muted from a touch to unlock audio playback on phones.
+const SILENT_WAV =
+  'data:audio/wav;base64,UklGRsQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+
+// One AudioContext + one <audio> element shared by the mic and Vasco's voice, created from the tap
+// that opens voice mode. iOS Safari only lets audio run when it was started inside a touch, and a
+// second context created later (after network awaits) stays suspended/silent — the mic then sends
+// nothing and Vasco never answers.
+let sharedCtx = null;
+let sharedAudio = null;
+
+export function primeVoiceAudio() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (Ctx && (!sharedCtx || sharedCtx.state === 'closed')) {
+    try {
+      sharedCtx = new Ctx({ latencyHint: 'interactive' });
+    } catch {
+      try {
+        sharedCtx = new Ctx();
+      } catch {
+        sharedCtx = null;
+      }
+    }
+  }
+  if (sharedCtx) {
+    if (sharedCtx.state !== 'running') sharedCtx.resume().catch(() => {});
+    try {
+      // Playing one silent sample inside the gesture is what really unlocks WebAudio on iOS.
+      const s = sharedCtx.createBufferSource();
+      s.buffer = sharedCtx.createBuffer(1, 1, sharedCtx.sampleRate);
+      s.connect(sharedCtx.destination);
+      s.start(0);
+    } catch {}
+  }
+  if (!sharedAudio) sharedAudio = new Audio();
+  const a = sharedAudio;
+  if (!a.dataset.unlocked && a.paused) {
+    a.dataset.unlocked = '1';
+    a.muted = true;
+    a.src = SILENT_WAV;
+    const reset = () => {
+      a.pause();
+      a.muted = false;
+    };
+    const p = a.play();
+    if (p && p.then)
+      p.then(reset, () => {
+        reset();
+        delete a.dataset.unlocked; // not allowed yet: retry on the next touch
+      });
+    else reset();
+  }
+  return sharedCtx;
+}
+
+// Audio-thread processors (public/voice-worklets.js): continuous, click-free playback and mic capture
+// that keep running even when the page is busy animating or rendering.
+const WORKLET_URL = `${import.meta.env.BASE_URL}voice-worklets.js`;
+const workletLoads = new WeakMap();
+function loadWorklets(ctx) {
+  if (!ctx?.audioWorklet || typeof AudioWorkletNode === 'undefined') return Promise.resolve(false);
+  if (!workletLoads.has(ctx)) {
+    workletLoads.set(
+      ctx,
+      ctx.audioWorklet.addModule(WORKLET_URL).then(
+        () => true,
+        () => false
+      )
+    );
+  }
+  return workletLoads.get(ctx);
+}
+
+/*
+ * Direct Gemini Live connection, exposing the same small interface as our relay WebSocket
+ * (send / close / readyState / onmessage / onclose, relay-style events), so the rest of the overlay
+ * doesn't care which one is used. Our server only hands out a single-use token with Vasco's setup
+ * locked, and runs the tools (web search…) Gemini asks for; the voice itself streams straight from
+ * Google to the phone, without the hosting proxy that made long answers stutter.
+ */
+const LIVE_WORKER_URL = `${import.meta.env.BASE_URL}voice-live-worker.js`;
+
+class DirectLive {
+  // getPlayer(): Promise<AudioWorkletNode|null> — the audio-thread player the worker feeds directly.
+  constructor(start, getPlayer) {
+    this.readyState = 0;
+    this.onopen = null;
+    this.onmessage = null;
+    this.onclose = null;
+    this.worker = null;
+    this.closed = false;
+    this.ended = false;
+    this.web = start.web_search;
+    this.tools = {};
+    this.begin(start, getPlayer);
+  }
+
+  async begin(start, getPlayer) {
+    try {
+      const [res, node] = await Promise.all([
+        apiFetch('/api/voice/live-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(start),
+        }),
+        getPlayer().catch(() => null),
+      ]);
+      if (!res.ok) throw new Error(await readError(res));
+      const cfg = await res.json();
+      if (this.closed) return this.end();
+      this.tools = cfg.tools || {};
+      // The WebSocket lives in a worker: receiving the voice never waits for the page.
+      const worker = new Worker(LIVE_WORKER_URL);
+      this.worker = worker;
+      worker.onmessage = (e) => {
+        const d = e.data || {};
+        if (d.type === 'msg') this.receive(d.msg);
+        else if (d.type === 'pcm') this.onmessage?.({ data: d.buf });
+        else if (d.type === 'closed') this.end();
+      };
+      worker.onerror = () => this.end();
+      const msg = { type: 'connect', url: cfg.url, token: cfg.token, model: cfg.model };
+      if (node) {
+        const ch = new MessageChannel();
+        node.port.postMessage({ port: ch.port1 }, [ch.port1]);
+        worker.postMessage({ ...msg, port: ch.port2 }, [ch.port2]);
+      } else {
+        worker.postMessage(msg);
+      }
+    } catch (err) {
+      this.emit({ type: 'error', message: `${err?.message || err}` });
+      this.end();
+    }
+  }
+
+  emit(obj) {
+    this.onmessage?.({ data: JSON.stringify(obj) });
+  }
+
+  end() {
+    if (this.ended) return;
+    this.ended = true;
+    this.readyState = 3;
+    const w = this.worker;
+    if (w) setTimeout(() => w.terminate(), 200);
+    this.onclose?.();
+  }
+
+  // Ignore the rest of the current answer (the user tapped the sphere to cut Vasco).
+  dropAudio() {
+    this.worker?.postMessage({ type: 'drop' });
+  }
+
+  receive(msg) {
+    if (msg.setupComplete) {
+      this.readyState = 1;
+      this.emit({ type: 'ready' });
+      return;
+    }
+    const upd = msg.sessionResumptionUpdate;
+    if (upd) {
+      if (upd.resumable && upd.newHandle) this.emit({ type: 'session', handle: upd.newHandle });
+      return;
+    }
+    if (msg.goAway) {
+      this.emit({ type: 'reconnect' });
+      return;
+    }
+    if (msg.toolCall) {
+      this.runTools(msg.toolCall.functionCalls || []);
+      return;
+    }
+    const sc = msg.serverContent;
+    if (!sc) return;
+    if (sc.inputTranscription?.text) this.emit({ type: 'user_text', text: sc.inputTranscription.text });
+    if (sc.outputTranscription?.text) this.emit({ type: 'vasco_text', text: sc.outputTranscription.text });
+    if (sc.interrupted) this.emit({ type: 'interrupted' });
+    if (sc.turnComplete) this.emit({ type: 'turn_complete' });
+  }
+
+  async runTools(calls) {
+    const responses = [];
+    for (const fc of calls) {
+      const meta = this.tools[fc.name] || {};
+      this.emit({ type: 'tool', name: fc.name, label: meta.label || fc.name, icon: meta.icon || '🛠️' });
+      let result = 'Outil indisponible.';
+      try {
+        const res = await apiFetch('/api/voice/tool', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: fc.name, args: fc.args || {}, web_search: this.web }),
+        });
+        if (res.ok) result = (await res.json()).result;
+      } catch {}
+      responses.push({ id: fc.id, name: fc.name, response: { result } });
+    }
+    this.sendJson({ toolResponse: { functionResponses: responses } });
+  }
+
+  sendJson(obj) {
+    if (this.readyState === 1) this.worker?.postMessage({ type: 'json', text: JSON.stringify(obj) });
+  }
+
+  send(data) {
+    if (this.readyState !== 1 || !this.worker) return;
+    if (typeof data !== 'string') {
+      this.worker.postMessage({ type: 'audio', buf: data }, [data]); // base64 + send happen in the worker
+      return;
+    }
+    let d;
+    try {
+      d = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (d.type === 'text' && d.text) {
+      this.sendJson({ clientContent: { turns: [{ role: 'user', parts: [{ text: d.text }] }], turnComplete: true } });
+    } else if (d.type === 'stop') {
+      this.close();
+    }
+  }
+
+  close() {
+    this.closed = true;
+    if (this.worker) this.worker.postMessage({ type: 'close' });
+    else this.end();
+  }
+}
+
+function setAudioSession(type) {
+  // Safari 16.4+: keep the loudspeaker on while the mic is open (otherwise iOS may go silent/quiet).
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = type;
+  } catch {}
+}
 
 const VOICES = {
   male: { label: 'صوت راجل', icon: '👨' },
@@ -187,8 +422,16 @@ export default function VoiceModeOverlay({
   const wsRef = useRef(null);
   const playCtxRef = useRef(null);
   const playSourcesRef = useRef(new Set());
+  const playerRef = useRef(null); // AudioWorkletNode 'pcm-player' (null: fallback to buffer sources)
+  const playingRef = useRef(false);
+  const idleTimerRef = useRef(0);
   const nextPlayRef = useRef(0);
   const liveRef = useRef({ user: '', vasco: '', closed: true, drop: false });
+  const resumeRef = useRef(''); // Gemini session handle: a reconnect continues the same conversation
+  const directRef = useRef(true); // talk to Gemini directly (false once that failed: use our relay)
+  const retryRef = useRef(0);
+  const pingRef = useRef(0);
+  const bargeRef = useRef({ loud: 0, open: false, held: [] });
   const lastGenderRef = useRef(gender);
   const [toolNote, setToolNote] = useState('');
   const vad = useRef({ history: [], noise: 0.004, speechFrames: 0, recording: false, manual: false, chunks: [], preRoll: [], voicedMs: 0, lastVoice: 0, startedAt: 0, listenAt: 0 });
@@ -208,6 +451,7 @@ export default function VoiceModeOverlay({
   useEffect(() => {
     if (lastGenderRef.current === gender) return;
     lastGenderRef.current = gender;
+    resumeRef.current = ''; // a resumed session would keep the old voice
     if (activeRef.current && modeRef.current === 'live' && wsRef.current) reconnectLive();
   }, [gender]);
 
@@ -220,6 +464,9 @@ export default function VoiceModeOverlay({
   useEffect(() => {
     if (!isOpen) return undefined;
     activeRef.current = true;
+    resumeRef.current = '';
+    directRef.current = true;
+    retryRef.current = 0;
     mutedRef.current = false;
     setIsMuted(false);
     setErrorText('');
@@ -230,8 +477,8 @@ export default function VoiceModeOverlay({
         ? lastAssistant.content.replace(/[#*_`~>|]/g, '').slice(0, 200)
         : 'مرحبا بيك! هضر معايا بالدارجة، بالعربية، بالفرنسية ولا بالإنجليزية.'
     );
-    // Created during the click that opened the overlay, so later playback isn't blocked.
-    audioElRef.current = new Audio();
+    // Normally already primed by the button's tap (App.jsx); this is a safety net.
+    unlockAudio();
     start();
     const tick = () => {
       if (orbRef.current) {
@@ -241,11 +488,9 @@ export default function VoiceModeOverlay({
         orbRef.current.style.transform = `scale(${scale.toFixed(3)})`;
       }
       if (meterRef.current) {
-        const v = vad.current;
-        const lvl = Math.min(1, levelRef.current / 0.12);
-        const thr = Math.min(1, Math.max(0.006, v.noise * 2.6 + 0.003) / 0.12);
-        meterRef.current.style.setProperty('--lvl', `${(lvl * 100).toFixed(1)}%`);
-        meterRef.current.style.setProperty('--thr', `${(thr * 100).toFixed(1)}%`);
+        // Equalizer bars follow the mic level (0..1); while Vasco speaks, CSS animates them instead.
+        const lvl = Math.min(1, Math.sqrt(levelRef.current / 0.1));
+        meterRef.current.style.setProperty('--lvl', lvl.toFixed(3));
       }
       rafRef.current = requestAnimationFrame(tick);
     };
@@ -271,7 +516,19 @@ export default function VoiceModeOverlay({
     };
   }, [isOpen]);
 
+  // iOS / Android: an <audio> element and an AudioContext may only make sound once they have been
+  // started from a touch. Called on open and on every touch, so the spoken answer is never muted.
+  const unlockAudio = () => {
+    const ctx = primeVoiceAudio();
+    audioElRef.current = sharedAudio;
+    if (!playCtxRef.current || playCtxRef.current.state === 'closed') playCtxRef.current = ctx;
+    if (!ctxRef.current || ctxRef.current.state === 'closed') ctxRef.current = ctx;
+    playCtxRef.current?.resume().catch(() => {});
+    ctxRef.current?.resume().catch(() => {});
+  };
+
   const teardown = () => {
+    clearInterval(pingRef.current);
     abortRef.current?.abort();
     closeLive();
     stopPlayback();
@@ -281,15 +538,33 @@ export default function VoiceModeOverlay({
     recognitionRef.current = null;
     if (procRef.current) {
       procRef.current.onaudioprocess = null;
+      if (procRef.current.port) procRef.current.port.onmessage = null;
       try {
         procRef.current.disconnect();
       } catch {}
     }
     procRef.current = null;
+    if (playerRef.current) {
+      playerRef.current.port.onmessage = null;
+      try {
+        playerRef.current.disconnect();
+      } catch {}
+    }
+    playerRef.current = null;
+    playingRef.current = false;
+    clearTimeout(idleTimerRef.current);
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
-    ctxRef.current?.close().catch(() => {});
+    const ctx = ctxRef.current;
+    if (ctx) {
+      ctx.onstatechange = null;
+      // The shared context is only paused, so the next opening doesn't need a new unlock.
+      if (ctx === sharedCtx) ctx.suspend().catch(() => {});
+      else ctx.close().catch(() => {});
+    }
     ctxRef.current = null;
+    playCtxRef.current = null;
+    setAudioSession('auto');
   };
 
   const start = async () => {
@@ -324,14 +599,9 @@ export default function VoiceModeOverlay({
     modeRef.current = 'live';
     setEngine('live');
     setPhaseBoth('connecting');
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    try {
-      playCtxRef.current = new Ctx({ sampleRate: 24000 });
-    } catch {
-      playCtxRef.current = new Ctx();
-    }
-    playCtxRef.current.resume().catch(() => {});
-    const ok = await connectLive();
+    if (!playCtxRef.current || playCtxRef.current.state === 'closed') playCtxRef.current = primeVoiceAudio();
+    playCtxRef.current?.resume().catch(() => {});
+    const [ok] = await Promise.all([connectLive(), ensurePlayer(playCtxRef.current)]);
     if (!activeRef.current) return true;
     if (!ok) {
       closeLive();
@@ -344,28 +614,66 @@ export default function VoiceModeOverlay({
     return true;
   };
 
-  const connectLive = () =>
+  // Direct connection to Gemini first (fast, smooth voice); our relay is the fallback.
+  const connectLive = async () => {
+    if (directRef.current) {
+      const ok = await openLive(true);
+      if (ok || !activeRef.current) return ok;
+      directRef.current = false; // direct path unavailable on this network: use the relay
+    }
+    return openLive(false);
+  };
+
+  const openLive = (direct) =>
     new Promise((resolve) => {
-      const token = localStorage.getItem('vasco_auth_token') || '';
-      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${proto}://${window.location.host}/api/voice/live?token=${encodeURIComponent(token)}`);
-      ws.binaryType = 'arraybuffer';
+      const { webSearch: web, systemPrompt: sys } = propsRef.current;
+      const history = messagesRef.current
+        .filter((m) => m.content && (m.role === 'user' || m.role === 'assistant'))
+        .slice(-10)
+        .map((m) => ({ role: m.role, content: m.content }));
+      const start = {
+        voice: genderRef.current,
+        web_search: web,
+        system_prompt: sys || '',
+        history,
+        resume: resumeRef.current || '',
+      };
+      let ws;
+      if (direct) {
+        ws = new DirectLive(start, () =>
+          ensurePlayer(playCtxRef.current || primeVoiceAudio()).then(() => playerRef.current)
+        );
+      } else {
+        const token = localStorage.getItem('vasco_auth_token') || '';
+        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        ws = new WebSocket(`${proto}://${window.location.host}/api/voice/live?token=${encodeURIComponent(token)}`);
+        ws.binaryType = 'arraybuffer';
+      }
       wsRef.current = ws;
       let settled = false;
+      let readyOk = false;
       const settle = (v) => {
         if (!settled) {
           settled = true;
+          readyOk = v;
           resolve(v);
         }
       };
-      const timer = setTimeout(() => settle(false), 15000);
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settle(false);
+        try {
+          ws.close();
+        } catch {}
+      }, 15000);
       ws.onopen = () => {
-        const { webSearch: web, systemPrompt: sys } = propsRef.current;
-        const history = messagesRef.current
-          .filter((m) => m.content && (m.role === 'user' || m.role === 'assistant'))
-          .slice(-10)
-          .map((m) => ({ role: m.role, content: m.content }));
-        ws.send(JSON.stringify({ type: 'start', voice: genderRef.current, web_search: web, system_prompt: sys || '', history }));
+        if (direct) return;
+        ws.send(JSON.stringify({ type: 'start', ...start }));
+        // Keep-alive: mobile networks and proxies drop WebSockets that look idle.
+        clearInterval(pingRef.current);
+        pingRef.current = setInterval(() => {
+          if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' }));
+        }, 20000);
       };
       ws.onmessage = (e) => {
         if (typeof e.data !== 'string') {
@@ -381,7 +689,12 @@ export default function VoiceModeOverlay({
         if (d.type === 'ready') {
           clearTimeout(timer);
           liveRef.current = { user: '', vasco: '', closed: true, drop: false };
+          retryRef.current = 0;
           settle(true);
+        } else if (d.type === 'session') {
+          resumeRef.current = d.handle || '';
+        } else if (d.type === 'pong') {
+          // keep-alive answer
         } else if (d.type === 'error') {
           clearTimeout(timer);
           if (settled) {
@@ -395,9 +708,18 @@ export default function VoiceModeOverlay({
       };
       ws.onclose = () => {
         clearTimeout(timer);
+        if (wsRef.current === ws) clearInterval(pingRef.current);
+        const wasReady = readyOk;
         settle(false);
-        if (wsRef.current === ws && activeRef.current && modeRef.current === 'live') {
+        if (wasReady && wsRef.current === ws && activeRef.current && modeRef.current === 'live') {
+          // Dropped mid-conversation (network switch, server time limit…): reconnect silently and
+          // resume the same Gemini session; only bother the user if that keeps failing.
           wsRef.current = null;
+          if (retryRef.current < 4) {
+            retryRef.current += 1;
+            setTimeout(() => activeRef.current && reconnectLive(true), 300 * retryRef.current);
+            return;
+          }
           stopLivePlayback();
           setErrorText('انقطع الاتصال مع فاسكو. نقر على الكرة باش تعاود. / Connexion perdue : touchez la sphère.');
           setPhaseBoth('error');
@@ -405,18 +727,26 @@ export default function VoiceModeOverlay({
       };
     });
 
-  const reconnectLive = async () => {
+  const reconnectLive = async (silent = false) => {
     const old = wsRef.current;
     wsRef.current = null;
     try {
       old?.close();
     } catch {}
-    stopLivePlayback();
-    setPhaseBoth('connecting');
-    const ok = await connectLive();
+    // A silent reconnect lets the answer already received finish playing.
+    if (!silent) {
+      stopLivePlayback();
+      setPhaseBoth('connecting');
+    }
+    let ok = await connectLive();
+    for (let i = 1; !ok && silent && activeRef.current && i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 600 * i));
+      ok = await connectLive();
+    }
     if (!activeRef.current) return;
-    if (ok) setPhaseBoth('listening');
-    else {
+    if (ok) {
+      if (phaseRef.current !== 'speaking') setPhaseBoth('listening');
+    } else {
       setErrorText('ما قدرتش نتاصل بفاسكو. نقر على الكرة باش تعاود. / Reconnexion impossible : touchez la sphère.');
       setPhaseBoth('error');
     }
@@ -454,6 +784,7 @@ export default function VoiceModeOverlay({
         break;
       case 'turn_complete':
         L.drop = false;
+        playerRef.current?.port.postMessage('flush');
         // A tool call closes an empty turn first: only save turns where Vasco actually spoke.
         if (L.vasco.trim()) {
           propsRef.current.onNewVoiceTurnSaved?.(L.user.trim() || '🎙️', { role: 'assistant', content: L.vasco.trim() });
@@ -461,37 +792,83 @@ export default function VoiceModeOverlay({
         }
         break;
       case 'reconnect':
-        reconnectLive();
+        // Gemini announced the end of this connection (goAway): move to a new one, same conversation.
+        reconnectLive(true);
         break;
       default:
     }
   };
 
   // Gapless playback of Vasco's 24 kHz speech chunks.
+  const onPlayerState = (state) => {
+    if (state === 'playing') {
+      playingRef.current = true;
+      clearTimeout(idleTimerRef.current);
+      if (phaseRef.current !== 'speaking') setPhaseBoth('speaking');
+    } else if (state === 'idle') {
+      playingRef.current = false;
+      clearTimeout(idleTimerRef.current);
+      // Wait a moment before showing "listening": the rest of the answer is often on its way.
+      idleTimerRef.current = setTimeout(() => {
+        if (!playingRef.current && phaseRef.current === 'speaking') setPhaseBoth('listening');
+      }, 700);
+    }
+  };
+
+  const ensurePlayer = async (ctx) => {
+    if (playerRef.current || !ctx || !(await loadWorklets(ctx))) return;
+    if (playerRef.current || !activeRef.current) return;
+    try {
+      const node = new AudioWorkletNode(ctx, 'pcm-player', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+      node.port.onmessage = (e) => onPlayerState(e.data);
+      node.connect(ctx.destination);
+      playerRef.current = node;
+    } catch {
+      playerRef.current = null;
+    }
+  };
+
   const playPcm = (buf) => {
     if (liveRef.current.drop) return;
     const ctx = playCtxRef.current;
     if (!ctx || !buf.byteLength) return;
     const i16 = new Int16Array(buf.byteLength % 2 ? buf.slice(0, buf.byteLength - 1) : buf);
+    const player = playerRef.current;
+    if (player) {
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+      player.port.postMessage(f32, [f32.buffer]);
+      return;
+    }
     const ab = ctx.createBuffer(1, i16.length, 24000);
     const ch = ab.getChannelData(0);
     for (let i = 0; i < i16.length; i++) ch[i] = i16[i] / 32768;
     const src = ctx.createBufferSource();
     src.buffer = ab;
     src.connect(ctx.destination);
-    const t = Math.max(ctx.currentTime + 0.04, nextPlayRef.current);
+    // Jitter buffer: chunks arrive unevenly over a phone network. Starting (or restarting after an
+    // underrun) slightly in the future keeps the speech continuous instead of choppy.
+    const now = ctx.currentTime;
+    const t = nextPlayRef.current > now + 0.02 ? nextPlayRef.current : now + (nextPlayRef.current ? 0.18 : 0.25);
     src.start(t);
     nextPlayRef.current = t + ab.duration;
     const set = playSourcesRef.current;
     set.add(src);
     src.onended = () => {
       set.delete(src);
-      if (!set.size && phaseRef.current === 'speaking') setPhaseBoth('listening');
+      // Wait a moment before showing "listening": the next chunk of the same answer is often on its way.
+      if (!set.size)
+        setTimeout(() => {
+          if (!set.size && phaseRef.current === 'speaking') setPhaseBoth('listening');
+        }, 600);
     };
     if (phaseRef.current !== 'speaking') setPhaseBoth('speaking');
   };
 
   const stopLivePlayback = () => {
+    playerRef.current?.port.postMessage('clear');
+    playingRef.current = false;
+    clearTimeout(idleTimerRef.current);
     for (const src of playSourcesRef.current) {
       src.onended = null;
       try {
@@ -512,8 +889,6 @@ export default function VoiceModeOverlay({
       } catch {}
     }
     stopLivePlayback();
-    playCtxRef.current?.close().catch(() => {});
-    playCtxRef.current = null;
   };
 
   const openMic = async (deviceId) => {
@@ -524,12 +899,14 @@ export default function VoiceModeOverlay({
     // Release the previous device, if any.
     if (procRef.current) {
       procRef.current.onaudioprocess = null;
+      if (procRef.current.port) procRef.current.port.onmessage = null;
       try {
         procRef.current.disconnect();
       } catch {}
       procRef.current = null;
     }
     streamRef.current?.getTracks().forEach((t) => t.stop());
+    setAudioSession('play-and-record');
     try {
       const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
       if (deviceId) audio.deviceId = { exact: deviceId };
@@ -551,23 +928,50 @@ export default function VoiceModeOverlay({
         .then((list) => setMics(list.filter((d) => d.kind === 'audioinput')))
         .catch(() => {});
       let ctx = ctxRef.current;
-      if (!ctx || ctx.state === 'closed') {
+      if (!ctx || ctx.state === 'closed') ctx = primeVoiceAudio();
+      let src;
+      try {
+        src = ctx.createMediaStreamSource(stream);
+      } catch {
+        // Firefox refuses a mic whose rate differs from the context's: give the mic its own context.
         const Ctx = window.AudioContext || window.webkitAudioContext;
         const rate = stream.getAudioTracks()[0]?.getSettings?.().sampleRate;
         try {
-          ctx = new Ctx(rate ? { sampleRate: rate } : undefined); // Firefox needs the mic's own rate
+          ctx = new Ctx(rate ? { sampleRate: rate } : undefined);
         } catch {
           ctx = new Ctx();
         }
-        ctxRef.current = ctx;
+        src = ctx.createMediaStreamSource(stream);
       }
+      ctxRef.current = ctx;
+      if (!playCtxRef.current || playCtxRef.current.state === 'closed') playCtxRef.current = ctx;
+      // iOS pauses ("interrupted") the context when the mic starts or a call/Siri happens: resume it.
+      ctx.onstatechange = () => {
+        if (activeRef.current && ctx.state !== 'running' && ctx.state !== 'closed') ctx.resume().catch(() => {});
+      };
       await ctx.resume().catch(() => {});
-      const src = ctx.createMediaStreamSource(stream);
-      const proc = ctx.createScriptProcessor(2048, 1, 1);
-      proc.onaudioprocess = (e) => onFrame(e.inputBuffer.getChannelData(0), ctx.sampleRate);
-      src.connect(proc);
-      proc.connect(ctx.destination); // outputs silence; needed for the callback to run
-      procRef.current = proc;
+      let tapped = false;
+      if (await loadWorklets(ctx)) {
+        try {
+          // Mic capture on the audio thread: no frames lost when the page is busy.
+          const node = new AudioWorkletNode(ctx, 'mic-tap', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+          node.port.onmessage = (e) => onFrame(e.data, ctx.sampleRate);
+          const mute = ctx.createGain();
+          mute.gain.value = 0;
+          src.connect(node);
+          node.connect(mute);
+          mute.connect(ctx.destination); // keeps the node pulled by the graph, outputs silence
+          procRef.current = node;
+          tapped = true;
+        } catch {}
+      }
+      if (!tapped) {
+        const proc = ctx.createScriptProcessor(2048, 1, 1);
+        proc.onaudioprocess = (e) => onFrame(e.inputBuffer.getChannelData(0), ctx.sampleRate);
+        src.connect(proc);
+        proc.connect(ctx.destination); // outputs silence; needed for the callback to run
+        procRef.current = proc;
+      }
       diagRef.current = { frames: 0, startedAt: performance.now(), peak: 0, peakSince: performance.now() };
       vad.current.history = [];
       listen();
@@ -639,10 +1043,27 @@ export default function VoiceModeOverlay({
     if (modeRef.current === 'live') {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== 1 || mutedRef.current) return;
-      // While Vasco talks, quiet sound is probably his own voice from the speakers:
-      // send silence unless the user clearly speaks over him (barge-in).
-      const gate = playSourcesRef.current.size > 0 && rms < Math.max(0.02, v.noise * 3.5);
-      ws.send(toPcm16k(frame, rate, gate));
+      // While Vasco talks, the phone's mic hears his voice from the loudspeaker; sending it makes Gemini
+      // think the user interrupts and cut its own answer (choppy speech). So silence is sent unless the
+      // user speaks clearly louder than the echo for ~0.2 s (barge-in); the held frames are then sent.
+      const b = bargeRef.current;
+      if (playingRef.current || playSourcesRef.current.size > 0) {
+        if (!b.open) {
+          b.loud = rms > Math.max(0.045, v.noise * 5) ? b.loud + 1 : 0;
+          b.held.push(frame);
+          if (b.held.length > 8) b.held.shift();
+          if ((b.loud * frame.length) / rate < 0.2) {
+            ws.send(toPcm16k(frame, rate, true));
+            return;
+          }
+          b.open = true;
+          for (const f of b.held.slice(0, -1)) ws.send(toPcm16k(f, rate, false));
+          b.held = [];
+        }
+      } else if (b.open || b.loud || b.held.length) {
+        bargeRef.current = { loud: 0, open: false, held: [] };
+      }
+      ws.send(toPcm16k(frame, rate, false));
       return;
     }
 
@@ -898,6 +1319,7 @@ export default function VoiceModeOverlay({
       if (p === 'speaking' || p === 'thinking') {
         stopLivePlayback();
         liveRef.current.drop = true; // ignore the rest of this answer
+        wsRef.current?.dropAudio?.();
         setPhaseBoth('listening');
       } else if (p === 'error') {
         teardown();
@@ -931,14 +1353,31 @@ export default function VoiceModeOverlay({
     ? 'thinking'
     : phase;
 
+  const statusText = isMuted
+    ? '🔇 الميكرو مقطوع / Micro coupé'
+    : phase === 'error'
+    ? 'نقر على الكرة باش تعاود / Touchez la sphère pour réessayer'
+    : (engine === 'live' && LIVE_STATUS[phase]) || STATUS[phase] || '';
+  const [statusMain, statusSub] = statusText.split(' / ');
+  const chip = {
+    listening: 'À l’écoute',
+    speaking: 'Vasco parle',
+    thinking: phase === 'connecting' || phase === 'starting' ? 'Connexion…' : 'Réflexion…',
+    muted: 'Micro coupé',
+    error: 'Hors ligne',
+  }[orbClass];
+
   return (
     <div
-      className="live-voice-overlay"
-      onPointerDown={() => {
-        ctxRef.current?.resume().catch(() => {});
-        playCtxRef.current?.resume().catch(() => {});
-      }}
+      className={`live-voice-overlay state-${orbClass}`}
+      onPointerDown={unlockAudio}
     >
+      <div className="live-voice-header">
+        <span className={`live-chip ${orbClass}`}>
+          <i className="live-dot" />
+          {engine === 'live' ? 'Direct' : 'Vocal'} · {chip}
+        </span>
+      </div>
       <div className="live-voice-top">
         <div className="live-voice-caption" dir="auto">
           {caption}
@@ -969,6 +1408,10 @@ export default function VoiceModeOverlay({
 
       <div className="live-voice-center">
         <div className={`live-voice-orb-container ${orbClass}`} onClick={handleOrbClick} title="Touchez pour interrompre / réessayer">
+          <span className="orb-ripple r1" />
+          <span className="orb-ripple r2" />
+          <span className="orb-ripple r3" />
+          <span className="orb-spinner" />
           <div className="cloud-orb" ref={orbRef}>
             <div className="cloud-layer cloud-sky" />
             <div className="cloud-layer cloud-mist-1" />
@@ -978,19 +1421,23 @@ export default function VoiceModeOverlay({
           <div className="orb-glow-ring" />
         </div>
         {engine !== 'browser' && phase !== 'error' && (
-          <div className="voice-meter" ref={meterRef} title="Niveau du micro (le trait = seuil de détection)">
-            <div className="voice-meter-fill" />
-            <div className="voice-meter-thr" />
+          <div className={`voice-eq ${orbClass}`} ref={meterRef} aria-hidden="true" title="Niveau du micro">
+            {[0.45, 0.7, 0.9, 1, 0.9, 0.7, 0.45].map((k, i) => (
+              <span key={i} style={{ '--k': k, '--d': `${i * 0.09}s` }} />
+            ))}
           </div>
         )}
         <div className="live-voice-status">
-          {isMuted ? '🔇 الميكرو مقطوع / Micro coupé' : phase === 'error' ? 'نقر على الكرة باش تعاود / Touchez la sphère pour réessayer' : (engine === 'live' && LIVE_STATUS[phase]) || STATUS[phase]}
+          <span className="status-main" dir="auto">
+            {statusMain}
+          </span>
+          {statusSub && <span className="status-sub">{statusSub}</span>}
         </div>
       </div>
 
       <div className="live-voice-bottom-bar">
         <div className="live-voice-options">
-          {engine !== 'browser' && mics.length > 0 && (
+          {engine !== 'browser' && (mics.length > 1 || hint === 'silent') && (
             <select
               className={`voice-mic-select ${hint === 'silent' ? 'attention' : ''}`}
               value={micId || streamRef.current?.getAudioTracks()[0]?.getSettings?.().deviceId || ''}

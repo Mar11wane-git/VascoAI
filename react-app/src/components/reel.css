@@ -1,0 +1,99 @@
+.reel {
+  margin: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.reel-portrait { max-width: 340px; }
+.reel-landscape { max-width: 560px; }
+
+.reel-stage {
+  position: relative;
+  width: 100%;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #0d0b1a;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+.reel-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+
+.reel-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 16px;
+  text-align: center;
+  color: #e9e6ff;
+  font-size: 13px;
+  background: linear-gradient(160deg, #2b1d5c, #0d0b1a);
+}
+.reel-spin { animation: reel-spin 0.9s linear infinite; }
+@keyframes reel-spin { to { transform: rotate(360deg); } }
+
+.reel-bigplay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 72px;
+  height: 72px;
+  margin: -36px 0 0 -36px;
+  border: none;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #111;
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  padding-left: 5px;
+}
+.reel-bigplay:hover { background: #fff; }
+
+.reel-rec {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(200, 20, 40, 0.85);
+  text-align: center;
+}
+
+.reel-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.reel-bar button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(127, 127, 160, 0.35);
+  background: rgba(127, 127, 160, 0.12);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.reel-bar button:disabled { opacity: 0.5; cursor: default; }
+.reel-bar .reel-primary {
+  border-color: transparent;
+  background: linear-gradient(135deg, #7c5cff, #c042ff);
+  color: #fff;
+  font-weight: 600;
+}

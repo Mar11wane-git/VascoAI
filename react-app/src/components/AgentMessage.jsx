@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { renderMarkdown } from '../lib/markdown.js';
 import { toolIcon } from '../lib/icons.js';
+import ReelPlayer from './ReelPlayer.jsx';
 
 const ease = [0.22, 1, 0.36, 1];
 
@@ -84,6 +85,7 @@ function argSummary(name, args = {}) {
   if (args.expression) return args.expression;
   if (args.code) return String(args.code).split('\n').find((l) => l.trim()) || 'script';
   if (args.prompt) return String(args.prompt).slice(0, 80);
+  if (args.title) return `« ${String(args.title).slice(0, 60)} »`;
   if (args.timezone) return args.timezone;
   return name === 'get_datetime' ? 'heure actuelle' : '';
 }
@@ -172,6 +174,7 @@ function ToolCard({ part, onOpenImage }) {
         <img className="tool-card-image" src={part.image_url} alt={part.args?.prompt || 'image'}
              loading="lazy" onClick={() => onOpenImage?.(part.image_url)} />
       )}
+      {part.video && status === 'ok' && <ReelPlayer video={part.video} />}
       {open && (
         <div className="tool-card-body">
           <div className="tool-card-section-title">Arguments</div>
